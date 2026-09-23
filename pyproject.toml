@@ -1,0 +1,14 @@
+[project]
+name = "tube-iptv"
+version = "0.1.0"
+description = "On-demand IPTV from yt-dlp sources"
+requires-python = ">=3.11"
+dependencies = ["fastapi==0.135.1", "uvicorn==0.42.0", "httpx==0.28.1", "yt-dlp[default]>=2026.3.17"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=1,<2"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

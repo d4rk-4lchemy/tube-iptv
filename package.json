@@ -1,0 +1,1 @@
+{"name":"tube-iptv-ui","private":true,"type":"module","scripts":{"vendor":"node scripts/vendor.mjs"},"dependencies":{"hls.js":"1.7.3"},"devDependencies":{"@playwright/test":"1.58.2"}}

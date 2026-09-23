@@ -1,0 +1,10 @@
+.venv/
+node_modules/
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+.data/
+app/static/vendor/
+artifacts/
+test-results/

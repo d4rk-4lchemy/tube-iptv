@@ -1,0 +1,26 @@
+services:
+  tube:
+    build: .
+    image: tube-iptv:local
+    container_name: tube-iptv
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - tube-data:/data
+    environment:
+      ENCODER: ${ENCODER:-software}
+      IDLE_SECONDS: ${IDLE_SECONDS:-25}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      STREAM_TOKEN: ${STREAM_TOKEN:-}
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Hardware acceleration: see compose.gpu.yaml and README.md.
+volumes:
+  tube-data:

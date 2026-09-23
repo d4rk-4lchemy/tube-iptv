@@ -1,0 +1,36 @@
+import { chromium, expect } from '@playwright/test';
+const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'], channel: 'chromium' });
+try {
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1100 } });
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto(process.env.TUBE_URL || 'http://127.0.0.1:8000');
+  await expect(page.getByText('Server connected')).toBeVisible();
+  const originalName = await page.locator('h1').textContent();
+  await page.getByRole('button', { name: 'Rename channel' }).click();
+  await page.getByLabel('Name displayed in the IPTV playlist').fill('Test / 02');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.locator('h1')).toHaveText('Test / 02');
+  await page.getByRole('button', { name: 'Rename channel' }).click();
+  await page.getByLabel('Name displayed in the IPTV playlist').fill(originalName);
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page.locator('h1')).toHaveText(originalName);
+  await expect(page.locator('#release-version option')).not.toHaveCount(1, { timeout: 45000 });
+  await page.locator('#release-channel').selectOption('nightly');
+  await expect(page.locator('#release-version option')).not.toHaveCount(1, { timeout: 45000 });
+  const setting = page.getByRole('switch', { name: 'Finish the current video when its source is removed' });
+  const originalSetting = await setting.isChecked();
+  await setting.setChecked(!originalSetting);
+  await expect(setting).toBeEnabled();
+  await page.reload();
+  await expect(page.getByText('Server connected')).toBeVisible();
+  await expect(setting).toBeChecked({ checked: !originalSetting });
+  await setting.setChecked(originalSetting);
+  await expect(setting).toBeEnabled();
+  await page.screenshot({ path: 'artifacts/desktop.png', fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) throw new Error('Mobile horizontal overflow');
+  await page.screenshot({ path: 'artifacts/mobile.png', fullPage: true });
+  if (errors.length) throw new Error(errors.join('\n'));
+  console.log('PASS: desktop/mobile UI, rename, stable/nightly dropdowns, no JS errors');
+} finally { await browser.close(); }
