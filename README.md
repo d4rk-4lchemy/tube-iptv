@@ -47,6 +47,8 @@ linki → yt-dlp (metadane playlist) → SQLite → losowanie materiału
 - **Żaden film ani segment HLS nie jest zapisywany do pliku.** FFmpeg wysyła segmenty na chroniony losowym sekretem endpoint loopback. Aplikacja przechowuje je jako bajty w RAM, bez katalogu z mediami i bez plików tymczasowych wideo.
 - Bufor opublikowanych segmentów: maksymalnie 12 segmentów / 64 MiB. Maksymalny pojedynczy segment: 8 MiB. Oddzielna kolejka segmentów oczekujących na manifest również ma limit. Limit dotyczy buforów mediów, nie całkowitego RSS Pythona, ekstraktora i FFmpeg.
 - Wyjście ma zawsze **1920×1080 / 25 fps**. yt-dlp preferuje bezpośredni strumień HTTPS do 1080p (ze względu na przewijanie); jeśli brak takiego wariantu, dopuszcza pozostałe formaty, w tym HLS; słabsze materiały są powiększane z zachowaniem proporcji i czarnymi pasami (np. po bokach dla 4:3).
+- Filmy VOD są odczytywane z ograniczonym zapasem: osobna kolejka przechowuje do **3 gotowych segmentów (zwykle 12 s, maksymalnie 24 MiB)** przed publikacją. FFmpeg może ją szybko uzupełnić, ale pełna kolejka wstrzymuje upload; aplikacja nie pobiera całego filmu z wyprzedzeniem. Osobne zadanie publikuje segmenty według zegara, więc player nie zużywa tego zapasu przez start przy końcu playlisty. Transmisje źródłowe live nadal są odczytywane w czasie rzeczywistym.
+- Do 20 sekund przed końcem filmu aplikacja może odczytać metadane/adresy kolejnego źródła. Ten odczyt jest anulowany po wygaśnięciu widzów; dane usuniętego źródła nie są używane przy przejściu.
 - Segment trwa zwykle 4 sekundy. Playlisty HLS udostępniają ostatnich 6 segmentów, starsze są krótko przechowywane dla klientów. Granice materiałów mają `EXT-X-DISCONTINUITY`, a globalna numeracja segmentów nie cofa się.
 - Zegar kanału startuje po odczytaniu pierwszego źródła i biegnie również bez widzów. Pierwszy widz uruchamia ekstrakcję i FFmpeg z przewinięciem do aktualnej pozycji programu. Kolejni dołączają do tego samego producenta. Na start kanał wysyła planszę **LOADING…** z ciszą (H.264/AAC 1080p, wideo CBR 3000 kb/s z wypełnieniem HRD, również dla statycznego obrazu), także do zewnętrznych odtwarzaczy IPTV. Pierwsze dwa segmenty planszy generowane są w przyspieszonym tempie w RAM, równolegle z ekstrakcją źródła, a kolejne w tempie odtwarzania. Pierwszy gotowy segment filmu kończy generator planszy; przejście używa `EXT-X-DISCONTINUITY`. Odtwarzacz może jeszcze wyświetlić wcześniej zbuforowaną planszę. Plansza nie zatrzymuje zegara kanału ani nie skraca ekstrakcji. HLS wprowadza kilkunastosekundowe opóźnienie.
 - HLS składa się z krótkich zapytań HTTP, więc zakończenie oglądania jest rozpoznawane po braku kolejnych żądań. Domyślnie **25 sekund** po ostatnim żądaniu manifestu/segmentu kanał zatrzymuje procesy i zwalnia RAM (`IDLE_SECONDS`). Aktywne oczekiwanie na pierwszy manifest utrzymuje start; po rozłączeniu żądania lub 90 sekundach timeoutu jest kończone. Samo API statusu nie przedłuża emisji.
@@ -90,6 +92,7 @@ Python / FastAPI / SQLite, natywne moduły JS i lokalnie dostarczany hls.js. Bra
 | `app/sources.py` | Jedyna ścieżka wejściowa: ekstrakcja przez yt-dlp |
 | `app/versions.py` | Wydania, weryfikacja, atomowe przełączanie |
 | `app/engine.py` | Producent kanału, przewijanie wejść, HLS w RAM |
+| `app/buffer.py` | Ograniczony zapas segmentów i publikacja według czasu programu |
 | `app/slate.py` | Plansza startowa HLS w RAM, generowana tylko dla aktywnej sesji |
 | `app/timeline.py` | Trwały zegar ramówki, losowanie cykli, bieżący program i offset |
 | `app/db.py` | Kanały, źródła, materiały i ustawienia |
@@ -156,7 +159,11 @@ Test przesuwa zapisany zegar o 120 sekund, restartuje testowy kontener, dekoduje
 
 `docker compose logs -f` pokazuje czas ekstrakcji, pierwszy kompletny segment, gotowość dwóch segmentów, przerwane uploady i ostrzeżenia FFmpeg. Te same ostatnie pomiary są w `GET /api/status` → `diagnostics`. Adresy HTTP z ostrzeżeń FFmpeg są redagowane, aby nie zapisywać podpisanych URL-i CDN.
 
-Manifest FFmpeg i segment mogą docierać różnymi połączeniami, w dowolnej kolejności. Serwer publikuje segment dopiero po otrzymaniu **zarówno metadanych, jak i całego body**, zachowując kolejność wejściową. Utracony upload oznacza discontinuity i zachowanie jego miejsca na osi czasu. Wyjście FFmpeg używa trwałych połączeń HTTP, co ogranicza zrywanie transferu przy zamykaniu każdego segmentu.
+Manifest FFmpeg i segment mogą docierać różnymi połączeniami, w dowolnej kolejności. Serwer publikuje segment dopiero po otrzymaniu **zarówno metadanych, jak i całego body**, zachowując kolejność wejściową. Utracony upload oznacza discontinuity i zachowanie jego miejsca na osi czasu.
+
+Wewnętrzny odbiornik uploadów słucha wyłącznie na `127.0.0.1`, na automatycznie wybranym porcie, i sprawdza sekret kanału. Używa trwałych połączeń HTTP oraz `100 Continue`: FFmpeg dostaje zgodę na przesłanie segmentu dopiero, gdy jest miejsce w buforze. Stała lokalna nazwa użytkownika `upload` w URL uruchamia ten handshake w FFmpeg 5; nie jest hasłem ani sposobem autoryzacji. Samo keep-alive nie zapewniało poprawnego hamowania producenta. Odbiornik doczytuje kompletne żądania również po zamknięciu strony nadawczej, bez zapisu materiału na dysk. Po zakończeniu FFmpeg aplikacja czeka na końcową playlistę `ENDLIST` i przyjęcie jej segmentów do RAM, ale nie czeka na opróżnienie kolejki emisji przed przygotowaniem kolejnego źródła.
+
+Segment kolejnego klipu zaczyna się najwcześniej po końcu poprzedniego segmentu. Recovery wznawia od końca już przyjętych danych, również tych oczekujących w RAM; nie przewija ponownie do pozycji zegara. Wcześniejsze zakończenie źródła przesuwa istniejącą kolejność harmonogramu zamiast rozpoczynać ją od pierwszych utworów.
 
 Test usuwania aktywnego źródła, kończenia ostatniego filmu oraz dużych segmentów:
 
@@ -172,3 +179,11 @@ uv run python scripts/loading-check.py
 ```
 
 Test używa celowo opóźnionego źródła HTTP na porcie 8769, sprawdza zdekodowane piksele w Chromium i zapisuje zrzuty planszy oraz filmu w `artifacts/`.
+
+Test odporności na przerwę producenta (wyłącznie pusty kontener testowy; zatrzymuje jego FFmpeg na 6 sekund):
+
+```bash
+TEST_CONTAINER=tube-iptv-test uv run python scripts/buffer-check.py
+```
+
+Diagnostyka `/api/status` pokazuje `reserve_segments`, `reserve_seconds`, `reserve_bytes` oraz bieżący i maksymalny odstęp między publikacjami. Zapas nie gwarantuje ciągłości przy przerwie dłuższej niż dostępne segmenty ani przy problemach połączenia od serwera do odtwarzacza.

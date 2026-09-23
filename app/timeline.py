@@ -57,6 +57,33 @@ class Timeline:
         self.db.set_setting(self.key, self.state)
         return self.position(now)
 
+    def advance(self, current, now=None):
+        """Make the programme following ``current`` the active wall-clock slot.
+
+        Producers call this when media reaches EOF or becomes unavailable before
+        its scheduled boundary.  The schedule is rebased at that point so a
+        replacement can be encoded while the previous programme's RAM reserve
+        is still being aired.
+        """
+        now = self.clock() if now is None else now
+        if not self.state or now >= current.ends_at:
+            return self.position(now)
+        active = self.position(now)
+        if not active or active.key != current.key:
+            return active
+        following = self.position(current.ends_at + .001)
+        if not following:
+            return active
+        # Translate the existing rotation instead of restarting cycle zero.
+        # Restarting it repeatedly alternates its first two videos forever.
+        shift = now - current.ends_at
+        self.state['epoch'] += shift
+        if self.state['lead']:
+            self.state['lead']['starts_at'] += shift
+            self.state['lead']['ends_at'] += shift
+        self.db.set_setting(self.key, self.state)
+        return self.position(now)
+
     def _raw_order(self, cycle):
         items = list(self.state['pool'])
         # Two entries must alternate; for larger pools shuffle every cycle.

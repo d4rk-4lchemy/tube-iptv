@@ -2,6 +2,7 @@
 Uses only self-generated test media. Run against a disposable empty instance.
 """
 import asyncio
+from datetime import datetime
 from functools import partial
 from http.server import ThreadingHTTPServer
 from media_fixture import MediaHandler
@@ -80,6 +81,30 @@ async def main():
                     await asyncio.sleep(1)
                 assert changed, 'No transition to next clip'
                 print('PASS: next clip uses HLS discontinuity', flush=True)
+                seen = {}
+                for _ in range(45):
+                    manifest = (await client.get(url)).text
+                    stamp = duration = None
+                    for line in manifest.splitlines():
+                        if line.startswith('#EXT-X-PROGRAM-DATE-TIME:'):
+                            stamp = datetime.fromisoformat(line.split(':', 1)[1]).timestamp()
+                        elif line.startswith('#EXTINF:'):
+                            duration = float(line.split(':', 1)[1].split(',')[0])
+                        elif line.startswith('segments/') and stamp is not None:
+                            sequence = int(line.split('/')[1].split('.')[0])
+                            value = (stamp, duration)
+                            assert sequence not in seen or seen[sequence] == value, 'Segment identity changed'
+                            seen[sequence] = value
+                            stamp = None
+                    ordered = sorted(seen.items())
+                    for (left, (start, length)), (right, (end, _)) in zip(ordered, ordered[1:]):
+                        if right == left + 1:
+                            assert end >= start + length - .002, 'Overlapping media across a handoff'
+                    if len(seen) >= 12:
+                        break
+                    await asyncio.sleep(1)
+                assert len(seen) >= 12, 'Insufficient segments across multiple clips'
+                print('PASS: stable segment identities and non-overlapping media across multiple clips', flush=True)
                 if os.getenv('BROWSER_CHECK'):
                     browser = await asyncio.create_subprocess_exec('node', 'scripts/playback-check.mjs', env={**os.environ, 'TUBE_URL': BASE})
                     assert await browser.wait() == 0, 'Browser playback failed'

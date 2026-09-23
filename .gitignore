@@ -8,3 +8,5 @@ __pycache__/
 app/static/vendor/
 artifacts/
 test-results/
+/docs/
+AGENTS.md

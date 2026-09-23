@@ -59,7 +59,7 @@ class LoadingSlate:
             self.channel.changed.notify_all()
 
     async def run(self):
-        destination = f'http://127.0.0.1:{config.PORT}/internal/{self.channel.secret}/{self.clip}'
+        destination = f'{self.channel.upload_base}/{self.clip}'
         command = ['ffmpeg', '-hide_banner', '-nostdin', '-loglevel', 'error',
                    '-f', 'lavfi', '-i', 'color=c=black:s=1920x1080:r=25',
                    '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',

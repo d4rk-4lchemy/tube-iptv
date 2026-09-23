@@ -25,9 +25,13 @@ async def lifespan(app):
     app.state.versions = versions = Versions(db)
     app.state.sources = sources = Sources(db, versions)
     app.state.channel = Channel("main", db, sources)
+    from .ingest import UploadServer
+    uploads = UploadServer(app.state.channel)
+    await uploads.start()
     app.state.channel.clock_task = asyncio.create_task(app.state.channel.clock_loop())
     yield
     await app.state.channel.close()
+    await uploads.close()
     await sources.close()
     if versions.task and not versions.task.done():
         versions.task.cancel()

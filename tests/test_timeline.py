@@ -35,6 +35,32 @@ def test_crosses_programmes_and_many_cycles_without_any_producer(tmp_path):
     assert slot.offset(later) == 13
 
 
+def test_early_source_end_rebases_schedule_to_the_following_programme(tmp_path):
+    db = Database(tmp_path / 'db')
+    timeline = Timeline(db, 'main')
+    first = timeline.sync(items(60, 90), now=1000)
+    expected_next = timeline.position(first.ends_at + .001)
+
+    next_slot = timeline.advance(first, now=1025)
+
+    assert next_slot.item['url'] == expected_next.item['url']
+    assert next_slot.starts_at == 1025
+    assert next_slot.ends_at == 1025 + expected_next.item['duration']
+    assert timeline.position(1025) == next_slot
+    assert Timeline(db, 'main', clock=lambda: 1025).position() == next_slot
+
+
+def test_repeated_early_ends_preserve_the_entire_rotation(tmp_path):
+    timeline = Timeline(Database(tmp_path / 'rotation'), 'main')
+    current = timeline.sync(items(60, 60, 60, 60, 60), now=1000)
+    expected = [timeline.position(1000 + i * 60).item['url'] for i in range(15)]
+    actual = [current.item['url']]
+    for i in range(1, 15):
+        current = timeline.advance(current, now=1000 + i * 10)
+        actual.append(current.item['url'])
+    assert actual == expected
+
+
 def test_refresh_and_source_changes_preserve_current_start(tmp_path):
     db = Database(tmp_path / 'db')
     timeline = Timeline(db, 'main')
@@ -89,6 +115,7 @@ def test_seek_applies_to_both_remote_inputs_but_not_to_live():
     for index in seeks:
         assert command[index + 1:index + 3] == ['120.500000', '-i']
     assert command[command.index('-t') + 1] == '300.000000'
+    assert command[command.index('-http_persistent') + 1] == '1'
     assert '-ss' not in ffmpeg_command(formats, {'is_live': True}, 'http://localhost/output', offset=120)
 
 

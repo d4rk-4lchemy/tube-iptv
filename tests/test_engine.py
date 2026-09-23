@@ -94,6 +94,16 @@ async def test_manifest_before_upload_waits_without_losing_or_reordering():
     assert '#EXT-X-DISCONTINUITY\n' not in channel.manifest('test')
 
 
+async def test_endlist_waits_for_its_final_segment_body():
+    channel = Channel('main', None, None)
+    channel.clip = 'final'
+    await channel.ingest('final', 'index.m3u8', b'#EXTM3U\n#EXTINF:1,\n000000.ts\n#EXT-X-ENDLIST\n')
+    assert not channel.ingest_finished.is_set()
+    await channel.ingest('final', '000000.ts', b'G' * 188)
+    assert channel.ingest_finished.is_set()
+    assert len(channel.segments) == 1
+
+
 async def test_missing_segment_expires_when_it_leaves_upstream_window():
     channel = Channel('main', None, None)
     channel.clip_time = 1000
@@ -138,3 +148,112 @@ async def test_pending_loading_publication_cannot_follow_real_video():
     await pending
     assert [s.clip for s in channel.segments] == [loading.clip, loading.clip, 'real']
     await loading.close()
+
+
+async def test_next_source_prefetch_is_cancelled_and_reaped(tmp_path):
+    import time
+    db = Database(tmp_path / 'prefetch.sqlite')
+    db.execute("INSERT INTO sources(id,channel_id,url) VALUES('s','main','https://example.com/list')")
+    db.replace_media('s', 'Test', [{'url': 'https://example.com/a', 'title': 'A', 'duration': 10},
+                                 {'url': 'https://example.com/b', 'title': 'B', 'duration': 10}])
+    started, stopped = asyncio.Event(), asyncio.Event()
+    calls = []
+    class Source:
+        async def resolve(self, url):
+            calls.append(url)
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+    channel = Channel('main', db, Source())
+    slot = channel.scheduled()
+    channel.prefetch_task = asyncio.create_task(channel.prefetch_next(slot))
+    await asyncio.wait_for(started.wait(), 1)
+    assert calls == [channel.timeline.position(slot.ends_at + .001).item['url']]
+    assert calls[0] != slot.item['url']
+    await channel.cancel_prefetch()
+    assert stopped.is_set() and channel.prefetch_task is None and channel.prefetch_key is None
+    db.conn.close()
+
+
+def test_source_end_advances_channel_clock_without_waiting_for_boundary(tmp_path):
+    db = Database(tmp_path / 'advance.sqlite')
+    db.execute("INSERT INTO sources(id,channel_id,url) VALUES('s','main','https://example.com/list')")
+    db.replace_media('s', 'Test', [{'url': 'https://example.com/a', 'title': 'A', 'duration': 60},
+                                   {'url': 'https://example.com/b', 'title': 'B', 'duration': 90}])
+    now = [1000.]
+    channel = Channel('main', db, None)
+    channel.timeline.clock = lambda: now[0]
+    current = channel.scheduled()
+    expected_next = channel.timeline.position(current.ends_at + .001)
+
+    now[0] = 1025.
+    assert channel.advance_after_source(current, 'Source ended before its scheduled boundary')
+
+    active = channel.scheduled()
+    assert active.item['url'] == expected_next.item['url']
+    assert active.starts_at == now[0]
+    assert any('switching immediately' in event['text'] for event in channel.events)
+    db.conn.close()
+
+
+@pytest.mark.parametrize('exit_code,duration', [(0, 100), (1, 100), (0, 12)])
+async def test_recovery_and_handoff_keep_media_cursor_without_draining(tmp_path, monkeypatch, exit_code, duration):
+    from app.slate import LoadingSlate
+    db = Database(tmp_path / 'recovery.sqlite')
+    db.execute("INSERT INTO sources(id,channel_id,url) VALUES('s','main','https://example.com/list')")
+    db.replace_media('s', 'Test', [{'url': 'https://example.com/a', 'title': 'A', 'duration': duration}])
+    class Sources:
+        async def resolve(self, url):
+            return {'duration': duration}, [{'url': url, 'vcodec': 'h264', 'acodec': 'aac'}]
+    channel = Channel('main', db, Sources())
+    monkeypatch.setattr(LoadingSlate, 'start', lambda self: None)
+    launched = asyncio.Event()
+    final_upload = asyncio.Event()
+    commands = []
+    class Process:
+        returncode = None
+        def __init__(self, first):
+            self.first = first
+            self.stderr = self.lines()
+        async def lines(self):
+            if self.first:
+                for i in range(3):
+                    await upload(channel, channel.clip, i)
+                async def finish_upload():
+                    await asyncio.sleep(.03)
+                    await channel.ingest(channel.clip, 'index.m3u8', b'#EXTM3U\n#EXT-X-ENDLIST\n')
+                    final_upload.set()
+                if exit_code == 0:
+                    asyncio.create_task(finish_upload())
+                self.returncode = exit_code
+            else:
+                if exit_code == 0:
+                    assert final_upload.is_set(), 'Encoder advanced before its final upload was accepted'
+                launched.set()
+                await asyncio.Event().wait()
+            if False:
+                yield b''
+        async def wait(self):
+            return self.returncode
+    async def launch(*command, **kwargs):
+        commands.append(command)
+        return Process(len(commands) == 1)
+    async def stop(process):
+        process.returncode = 0
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', launch)
+    monkeypatch.setattr('app.engine.stop_process', stop)
+    task = asyncio.create_task(channel.run())
+    try:
+        await asyncio.wait_for(launched.wait(), 2)
+        def seek(command):
+            return float(command[command.index('-ss') + 1]) if '-ss' in command else 0
+        expected = seek(commands[0]) + 12 if duration == 100 else 0
+        assert seek(commands[1]) == pytest.approx(expected, abs=0.001)
+        assert channel.media_buffer.count == 3
+        assert not channel.segments
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        db.conn.close()

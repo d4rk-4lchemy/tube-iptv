@@ -41,7 +41,9 @@ def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duratio
         headers = {**info.get("http_headers", {}), **fmt.get("http_headers", {})}
         header_string = "".join(f"{k}: {v}\r\n" for k, v in headers.items()
                                 if not any(c in str(k) + str(v) for c in "\r\n"))
-        cmd += ["-re", "-rw_timeout", "15000000", "-reconnect", "1", "-reconnect_streamed", "1",
+        if info.get("is_live"):
+            cmd += ["-re"]
+        cmd += ["-rw_timeout", "15000000", "-reconnect", "1", "-reconnect_streamed", "1",
                 "-reconnect_delay_max", "3", "-protocol_whitelist", "http,https,tcp,tls,crypto"]
         if header_string:
             cmd += ["-headers", header_string]
@@ -77,7 +79,9 @@ def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duratio
             "-af", "aresample=async=1:first_pts=0", "-max_muxing_queue_size", "1024",
             "-f", "hls", "-hls_time", "4", "-hls_list_size", "6", "-hls_flags", "independent_segments",
             "-hls_segment_filename", destination + "/%06d.ts", "-method", "PUT",
-            "-http_persistent", "1", "-timeout", "10", destination + "/index.m3u8"]
+            # Keep connections open; UploadServer's 100-continue handshake
+            # gates segment bodies on RAM capacity, including final uploads.
+            "-http_persistent", "1", "-timeout", "20", destination + "/index.m3u8"]
     return cmd
 
 
@@ -85,6 +89,7 @@ class Channel:
     def __init__(self, channel_id, db, sources):
         self.id, self.db, self.sources = channel_id, db, sources
         self.secret = secrets.token_urlsafe(32)
+        self.upload_base = f'http://127.0.0.1:{config.PORT}/internal/{self.secret}'
         self.segments = deque()
         self.pending = {}
         self.sequence = 0
@@ -120,14 +125,22 @@ class Channel:
         self.events = deque(maxlen=30)
         self.changed = asyncio.Condition()
         self.lifecycle = asyncio.Lock()
+        self.ingest_lock = asyncio.Lock()
+        self.prefetch_task = None
+        self.prefetch_key = None
+        self.media_buffer = None
+        self.ingest_finished = asyncio.Event()
+        self.final_input_segment = None
 
     @property
     def finish_current_on_remove(self):
         return bool(self.db and self.db.setting('finish_current_on_remove', False))
 
     def retained_current(self):
-        return (self.finish_current_on_remove and self.process is not None
-                and self.process.returncode is None and self.now is not None)
+        return (self.finish_current_on_remove and self.now is not None and (
+            (self.process is not None and self.process.returncode is None)
+            or (self.task is not None and not self.task.done()
+                and any(s.clip == self.clip for s in self.segments))))
 
     def available(self):
         return (bool(self.db.media(self.id)) or self.retained_current()
@@ -139,6 +152,8 @@ class Channel:
             return
         async with self.lifecycle:
             allowed = {item['url'] for item in self.db.media(self.id)}
+            if self.prefetch_key and self.prefetch_key[0] not in allowed:
+                await self.cancel_prefetch()
             removed_current = self.now and self.now['url'] not in allowed
             retain = removed_current and self.retained_current()
             if retain:
@@ -165,6 +180,16 @@ class Channel:
     def scheduled(self):
         return self.timeline.sync(self.db.media(self.id),
                                   preserve_removed=self.retained_current()) if self.timeline else None
+
+    def advance_after_source(self, slot, reason):
+        """Rebase the schedule when a source ends before its allotted slot."""
+        if not self.timeline:
+            return False
+        following = self.timeline.advance(slot)
+        if not following or following.key == slot.key:
+            return False
+        self.event(f"{reason}; switching immediately to {following.item['title']}")
+        return True
 
     async def clock_loop(self):
         while True:
@@ -221,6 +246,34 @@ class Channel:
             await asyncio.gather(self.monitor, return_exceptions=True)
         await self.stop()
 
+    async def cancel_prefetch(self):
+        if self.prefetch_task:
+            self.prefetch_task.cancel()
+            await asyncio.gather(self.prefetch_task, return_exceptions=True)
+        self.prefetch_task = None
+        self.prefetch_key = None
+
+    async def prefetch_next(self, slot):
+        # Resolve only the next source, shortly before the boundary. No media
+        # is fetched here, and cancellation reaps yt-dlp when viewers leave.
+        await asyncio.sleep(max(0, slot.ends_at - time.time() - 20))
+        current = self.scheduled()
+        if not current or current.key != slot.key:
+            return None
+        next_slot = self.timeline.position(slot.ends_at + .001)
+        if not next_slot or next_slot.item['url'] not in {m['url'] for m in self.db.media(self.id)}:
+            return None
+        self.prefetch_key = next_slot.key
+        try:
+            result = await self.sources.resolve(next_slot.item['url'])
+            self.event('Next source resolved ahead of programme boundary')
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The normal resolution/retry path reports errors if still relevant.
+            return None
+
     async def run(self):
         started = time.monotonic()
         self.metrics = {"resolve_seconds": None, "last_resolve_seconds": None,
@@ -230,11 +283,21 @@ class Channel:
         from .slate import LoadingSlate
         self.loading = LoadingSlate(self)
         self.loading.start()
+        from .buffer import MediaBuffer
+        self.media_buffer = MediaBuffer(self.publish_segment)
         failures = 0
+        skipped_urls = set()
+        recovery_attempts = {}
+        resume = None
         completed = None
         try:
             while True:
                 slot = self.scheduled()
+                if completed is not None and self.clip == self.retained_clip and not self.db.media(self.id):
+                    self.state = "ended"
+                    self.now = None
+                    self.event("Retained video finished · final HLS segments available")
+                    return
                 if not slot:
                     self.state = "empty"
                     self.error = "Add at least one available, enabled source"
@@ -244,16 +307,24 @@ class Channel:
                     await asyncio.sleep(min(0.5, max(0.04, slot.ends_at - time.time())))
                     continue
                 item = slot.item
+                resume_offset = resume[1] if resume and resume[0] == slot.key else None
+                resume = None
+                offset = resume_offset if resume_offset is not None else slot.offset(time.time())
                 self.state = "buffering"
                 self.now = item
                 self.clip = secrets.token_hex(12)
+                self.ingest_finished.clear()
                 self.pending.clear()
                 self.published.clear()
                 self.clip_duration = 0.0
                 initial = self.clip_duration
                 try:
                     resolving = time.monotonic()
-                    info, formats = await self.sources.resolve(item["url"])
+                    resolved = None
+                    if self.prefetch_task and self.prefetch_key == slot.key:
+                        resolved = await self.prefetch_task
+                    await self.cancel_prefetch()
+                    info, formats = resolved or await self.sources.resolve(item["url"])
                     elapsed = round(time.monotonic() - resolving, 3)
                     self.metrics['last_resolve_seconds'] = elapsed
                     if self.metrics['resolve_seconds'] is None:
@@ -269,13 +340,14 @@ class Channel:
                     if not current or current.key != slot.key:
                         continue
                     slot = current
-                    offset = slot.offset(time.time())
-                    remaining = slot.ends_at - time.time()
+                    offset = resume_offset if resume_offset is not None else slot.offset(time.time())
+                    remaining = slot.item['duration'] - offset
                     if remaining < 0.25:
                         completed = slot.key
                         continue
-                    self.clip_time = slot.starts_at + offset
-                    destination = f"http://127.0.0.1:{config.PORT}/internal/{self.secret}/{self.clip}"
+                    self.clip_time = max(time.time(), self.media_buffer.tail_deadline or 0)
+                    self.prefetch_task = asyncio.create_task(self.prefetch_next(slot))
+                    destination = f"{self.upload_base}/{self.clip}"
                     command = ffmpeg_command(formats, info, destination, offset=offset, duration=remaining)
                     self.event(f"On air: {item['title']} · joining at {int(offset)}s")
                     self.ffmpeg_started = time.monotonic()
@@ -288,17 +360,48 @@ class Channel:
                         tail.append(message)
                         logger.warning("channel=%s ffmpeg: %s", self.id, message)
                     code = await self.process.wait()
+                    if code == 0:
+                        # Persistent HTTP uploads can still be in flight after
+                        # the encoder exits. Only ENDLIST acknowledges that
+                        # the final segment has entered our bounded queue.
+                        try:
+                            await asyncio.wait_for(self.ingest_finished.wait(), 20)
+                        except asyncio.TimeoutError as exc:
+                            raise RuntimeError(f'Final HLS upload was not acknowledged within 20s '
+                                               f'(last={self.last_input_segment}, final={self.final_input_segment}, '
+                                               f'pending={list(self.pending)}, announced={list(self.announced)})') from exc
                     if code or self.clip_duration == initial:
                         raise RuntimeError("FFmpeg: " + ("\n".join(tail)[-1200:] or f"No segments produced (exit {code}, seek {offset:.1f}s)"))
+                    produced = self.clip_duration
+                    shortfall = remaining - produced
+                    self.event(f"FFmpeg finished after {produced:.2f}s of {remaining:.2f}s allocated")
+                    if shortfall > 6 and not slot.item['estimated'] and not info.get('is_live'):
+                        attempts = recovery_attempts.get(slot.key, 0)
+                        if attempts < 1:
+                            recovery_attempts[slot.key] = attempts + 1
+                            resume = (slot.key, offset + produced)
+                            self.event(f"Source ended {shortfall:.2f}s early; refreshing direct URLs and resuming")
+                            continue
+                        self.event(f"Source remained {shortfall:.2f}s short after recovery")
                     if slot.item['estimated'] and not info.get('is_live'):
                         # Some generic extractors do not report duration. Learn it at EOF,
                         # without probing/downloading anything while there are no viewers.
                         self.db.execute("UPDATE media SET duration=? WHERE url=?",
                                         (offset + self.clip_duration, item['url']))
+                    # Do not wait for the scheduled boundary or drain the RAM
+                    # reserve.  Its final segments remain in FIFO order while
+                    # the next encoder is already preparing a replacement.
+                    self.advance_after_source(slot, "Source ended before its scheduled boundary")
+                    following = self.scheduled()
+                    if following and following.key != slot.key:
+                        resume = (following.key, 0.0)
                     completed = slot.key
                     self.scheduled()
                     failures = 0
+                    skipped_urls.clear()
+                    recovery_attempts.pop(slot.key, None)
                     if self.clip == self.retained_clip and not self.db.media(self.id):
+                        await self.media_buffer.drain()
                         self.state = "ended"
                         self.now = None
                         self.event("Retained video finished · final HLS segments available")
@@ -309,13 +412,40 @@ class Channel:
                     failures += 1
                     self.error = str(exc)[-1800:]
                     self.state = "error"
-                    self.event("Source unavailable; retrying at the current channel time: " + item["title"] + " · " + self.error)
-                    await asyncio.sleep(min(failures * 2, 20))
+                    self.event("Source unavailable: " + item["title"] + " · " + self.error)
+                    if self.process:
+                        await stop_process(self.process)
+                        self.process = None
+                    attempts = recovery_attempts.get(slot.key, 0)
+                    if attempts < 1:
+                        recovery_attempts[slot.key] = attempts + 1
+                        resume = (slot.key, offset + self.clip_duration)
+                        self.event("Refreshing direct URLs and retrying the current source")
+                        continue
+                    recovery_attempts.pop(slot.key, None)
+                    skipped_urls.add(item['url'])
+                    self.advance_after_source(slot, "Source failed")
+                    following = self.scheduled()
+                    if following and following.key != slot.key:
+                        resume = (following.key, 0.0)
+                    completed = slot.key
+                    # Continue through the remaining sources without delay. If
+                    # every enabled source failed, retain the former backoff
+                    # before beginning a fresh round.
+                    available_urls = {media['url'] for media in self.db.media(self.id)}
+                    if available_urls and available_urls <= skipped_urls:
+                        self.event("All enabled sources failed; retrying the rotation shortly")
+                        skipped_urls.clear()
+                        await asyncio.sleep(min(failures * 2, 20))
                 finally:
                     if self.process:
                         await stop_process(self.process)
                         self.process = None
         finally:
+            if self.media_buffer:
+                await self.media_buffer.close()
+                self.media_buffer = None
+            await self.cancel_prefetch()
             if self.loading:
                 await self.loading.close()
                 self.loading = None
@@ -324,6 +454,7 @@ class Channel:
 
     def begin_ingest(self, clip):
         if self.ingest_clip != clip:
+            self.final_input_segment = None
             self.ingest_clip = clip
             self.last_input_segment = -1
             self.gap_pending = False
@@ -333,6 +464,10 @@ class Channel:
             self.clip_duration = 0.0
 
     async def upload_aborted(self, clip, filename):
+        async with self.ingest_lock:
+            await self._upload_aborted(clip, filename)
+
+    async def _upload_aborted(self, clip, filename):
         if clip != self.clip or not filename.endswith('.ts'):
             return
         self.begin_ingest(clip)
@@ -342,6 +477,10 @@ class Channel:
     async def ingest(self, clip, filename, body):
         if self.loading and clip == self.loading.clip:
             return await self.loading.ingest(filename, body)
+        async with self.ingest_lock:
+            return await self._ingest(clip, filename, body)
+
+    async def _ingest(self, clip, filename, body):
         if clip != self.clip:
             return False
         self.begin_ingest(clip)
@@ -370,9 +509,14 @@ class Channel:
                     duration = None
             if indices:
                 self.window_start = max(self.window_start, min(indices))
+            if b'#EXT-X-ENDLIST' in body:
+                self.final_input_segment = max(indices, default=self.last_input_segment)
+                self.event(f'Final HLS playlist received: segment {self.final_input_segment}')
         else:
             return False
         await self.publish_ready()
+        if self.final_input_segment is not None and self.last_input_segment >= self.final_input_segment:
+            self.ingest_finished.set()
         return True
 
     async def publish_ready(self):
@@ -407,23 +551,38 @@ class Channel:
             if self.segment_sink:
                 await self.segment_sink(segment)
                 continue
-            if self.loading:
-                self.loading.disable()
-            self.append_segment(segment, self.gap_pending)
+            segment.discontinuity = int(self.gap_pending)
             self.gap_pending = False
-            self.state = "live"
-            self.error = None
-            self.metrics['last_segment_at'] = time.time()
-            if self.ffmpeg_started is not None and self.metrics.get('first_segment_seconds') is None:
-                elapsed = round(time.monotonic() - self.ffmpeg_started, 3)
-                self.metrics['first_segment_seconds'] = elapsed
-                self.event(f'First HLS segment ready {elapsed:.2f}s after FFmpeg launch')
-            if self.ffmpeg_started is not None and sum(s.source_url is not None for s in self.segments) >= 2 and self.metrics.get('ready_seconds') is None:
-                elapsed = round(time.monotonic() - self.startup_started, 3)
-                self.metrics['ready_seconds'] = elapsed
-                self.event(f'Stream ready in {elapsed:.2f}s (two segments in RAM)')
-            async with self.changed:
-                self.changed.notify_all()
+            if self.media_buffer:
+                await self.media_buffer.put(segment)
+            else:
+                await self.publish_segment(segment)
+
+    async def publish_segment(self, segment):
+        if self.loading:
+            self.loading.disable()
+        self.append_segment(segment, bool(segment.discontinuity))
+        self.state = "live"
+        self.error = None
+        now = time.time()
+        previous = self.metrics.get('last_segment_at')
+        if previous is not None:
+            interval = round(now - previous, 3)
+            self.metrics['segment_interval_seconds'] = interval
+            self.metrics['max_segment_interval_seconds'] = max(interval, self.metrics.get('max_segment_interval_seconds', 0))
+            if interval > max(6, segment.duration * 1.5):
+                self.event(f'Segment delivery gap: {interval:.2f}s')
+        self.metrics['last_segment_at'] = now
+        if self.ffmpeg_started is not None and self.metrics.get('first_segment_seconds') is None:
+            elapsed = round(time.monotonic() - self.ffmpeg_started, 3)
+            self.metrics['first_segment_seconds'] = elapsed
+            self.event(f'First HLS segment ready {elapsed:.2f}s after FFmpeg launch')
+        if self.ffmpeg_started is not None and sum(s.source_url is not None for s in self.segments) >= 2 and self.metrics.get('ready_seconds') is None:
+            elapsed = round(time.monotonic() - self.startup_started, 3)
+            self.metrics['ready_seconds'] = elapsed
+            self.event(f'Stream ready in {elapsed:.2f}s (two segments in RAM)')
+        async with self.changed:
+            self.changed.notify_all()
 
     def append_segment(self, segment, gap=False):
         if self.last_clip is not None and (self.last_clip != segment.clip or gap):
@@ -468,4 +627,7 @@ class Channel:
                 "events": list(self.events), "encoder": config.ENCODER,
                 "finish_current_on_remove": self.finish_current_on_remove,
                 "stream_revision": self.stream_revision, "stream_available": self.available() if self.db else False,
-                "diagnostics": self.metrics}
+                "diagnostics": {**self.metrics,
+                    "reserve_segments": self.media_buffer.count if self.media_buffer else 0,
+                    "reserve_seconds": round(self.media_buffer.seconds, 3) if self.media_buffer else 0,
+                    "reserve_bytes": self.media_buffer.bytes if self.media_buffer else 0}}
