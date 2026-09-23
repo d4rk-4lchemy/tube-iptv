@@ -1,107 +1,122 @@
 # Tube IPTV
 
-Jeden wspólny kanał IPTV z linków obsługiwanych przez **yt-dlp**. Filmy i playlisty trafiają do losowanej puli; wszyscy widzowie oglądają tę samą transmisję. Panel po angielsku, podgląd w przeglądarce, eksport playlisty IPTV i wybór wydań stable/nightly bez przebudowy obrazu.
+<p align="center">
+  <img src="app/static/logo.svg" alt="Tube IPTV logo" width="144">
+</p>
 
-## Uruchomienie
+<p align="center"><strong>One shared IPTV channel built from yt-dlp sources.</strong><br>
+Add videos or playlists, and every viewer joins the same live programme position.</p>
+
+Tube IPTV turns links supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp) into one continuously running HLS channel. It includes an English web console, browser preview, IPTV playlist export, and selectable stable/nightly yt-dlp releases without rebuilding the image.
+
+## Features
+
+- One shared, wall-clock programme for every viewer.
+- Video and playlist sources from yt-dlp-supported services.
+- HLS output at 1920×1080 / 25 fps with H.264 video and AAC audio.
+- RAM-only media buffers: videos and HLS segments are never written to disk.
+- Web preview, source management, playlist export, and broadcast diagnostics.
+- Stable and nightly yt-dlp releases with checksum verification and atomic activation.
+- CPU encoding by default, with optional VAAPI and Intel Quick Sync encoding.
+- A single Uvicorn worker with persistent scheduling metadata in SQLite.
+
+## Quick start
+
+Requirements: Docker with Compose and a host that can run FFmpeg in the image.
 
 ```bash
-sudo docker compose up -d --build
+docker compose up -d --build
 ```
 
-- Panel: **http://localhost:8000**
-- Playlista IPTV: **http://localhost:8000/playlist.m3u8**
-- Strumień HLS: **http://localhost:8000/channels/main/index.m3u8**
-- API: **http://localhost:8000/api/docs**
+Open the web console at <http://localhost:8000> and add a video, playlist, or channel URL.
 
-Serwer nasłuchuje na `0.0.0.0:8000`. Na telewizorze użyj adresu IP lub nazwy hosta serwera zamiast `localhost`. W panelu dodaj linki, poczekaj na ich odczytanie i skopiuj adres IPTV do VLC/Kodi/klienta IPTV. Podgląd w panelu uruchamia się dopiero po kliknięciu; sam otwarty panel ani pobranie playlisty IPTV nie uruchamia emisji.
+| Endpoint | Purpose |
+| --- | --- |
+| <http://localhost:8000> | Web console and browser preview |
+| <http://localhost:8000/playlist.m3u8> | IPTV playlist |
+| <http://localhost:8000/channels/main/index.m3u8> | Main HLS stream |
+| <http://localhost:8000/api/docs> | OpenAPI documentation |
 
-Konfiguracja opcjonalna:
+For a TV or another device, replace `localhost` with the server's IP address or hostname. Copy the IPTV URL into VLC, Kodi, or another IPTV player. The browser preview starts only after clicking **Watch channel**; opening the console or downloading the playlist does not start media production.
+
+### Configuration
 
 ```bash
 cp .env.example .env
-# Edytuj .env, następnie:
-sudo docker compose up -d
+# Edit .env, then:
+docker compose up -d
 ```
 
-`PUBLIC_URL` określa zewnętrzny adres serwera, np. `http://192.168.1.20:8000` lub adres reverse proxy. Bez tej wartości adres jest wyznaczany z żądania. Proxy powinno przepuszczać HLS bez cache, z timeoutem odpowiedzi przynajmniej 120 sekund.
+Important settings:
 
-`ADMIN_PASSWORD` włącza HTTP Basic dla panelu i API (login: `admin`). `STREAM_TOKEN` zabezpiecza playlistę i segmenty osobnym tokenem, automatycznie uwzględnianym w kopiowanych adresach. Domyślna konfiguracja jest przeznaczona do zaufanej sieci lokalnej: panel bez hasła, źródła mogą kierować również do serwisów w LAN. Nie wystawiaj takiej konfiguracji do Internetu; użyj hasła i HTTPS w reverse proxy. Użytkownik administracyjny kontroluje adresy otwierane przez ekstraktor.
+| Variable | Description |
+| --- | --- |
+| `PUBLIC_URL` | Public base URL used in copied playlist links, for example `http://192.168.1.20:8000`. |
+| `ADMIN_PASSWORD` | Enables HTTP Basic authentication for the console and API. The username is `admin`. |
+| `STREAM_TOKEN` | Adds a separate token to playlist and segment URLs. |
+| `ENCODER` | `software` by default; use `vaapi` or `qsv` for hardware encoding. |
+| `IDLE_SECONDS` | Stops media processes after this many seconds without HLS requests. Defaults to `25`. |
 
-Stan, źródła i zainstalowane wersje yt-dlp są zapisywane w wolumenie `tube-data`. Aktualizacja obrazu nie usuwa tych danych. Aplikacja działa jako UID/GID `10001`, z systemem plików kontenera tylko do odczytu i `/tmp` w tmpfs.
+The default configuration is intended for a trusted local network. Do not expose it directly to the Internet. Use `ADMIN_PASSWORD` and HTTPS at a reverse proxy. The proxy should pass HLS requests without caching and allow response timeouts of at least 120 seconds.
 
-## Jak działa transmisja
+Application state, sources, and installed yt-dlp releases are stored in the `tube-data` volume. Rebuilding the image does not remove them. The container runs as UID/GID `10001`, uses a read-only filesystem, and mounts `/tmp` as tmpfs.
+
+## How the channel works
 
 ```text
-linki → yt-dlp (metadane playlist) → SQLite → losowanie materiału
-                                               ↓
-                         yt-dlp (adresy video/audio, bez pobierania)
-                                               ↓
-                     FFmpeg (sieć → H.264 + AAC, 1920×1080 / 25 fps)
-                                               ↓
-                    lokalny HTTP PUT → ograniczony bufor RAM
-                                               ↓
-                            jedna playlista HLS → wszyscy widzowie
+links → yt-dlp (playlist metadata) → SQLite → shuffled programme pool
+                                                   ↓
+                          yt-dlp (video/audio URLs, without downloading)
+                                                   ↓
+                      FFmpeg (network → H.264 + AAC, 1920×1080 / 25 fps)
+                                                   ↓
+                         local HTTP PUT → bounded RAM buffer
+                                                   ↓
+                              one HLS playlist → every viewer
 ```
 
-- yt-dlp działa z `--skip-download` i `--no-cache-dir`. FFmpeg czyta wskazane przez niego adresy bezpośrednio z sieci. Także rozdzielone ścieżki audio/video YouTube nie wymagają lokalnego scalania plików.
-- **Żaden film ani segment HLS nie jest zapisywany do pliku.** FFmpeg wysyła segmenty na chroniony losowym sekretem endpoint loopback. Aplikacja przechowuje je jako bajty w RAM, bez katalogu z mediami i bez plików tymczasowych wideo.
-- Bufor opublikowanych segmentów: maksymalnie 12 segmentów / 64 MiB. Maksymalny pojedynczy segment: 8 MiB. Oddzielna kolejka segmentów oczekujących na manifest również ma limit. Limit dotyczy buforów mediów, nie całkowitego RSS Pythona, ekstraktora i FFmpeg.
-- Wyjście ma zawsze **1920×1080 / 25 fps**. yt-dlp preferuje bezpośredni strumień HTTPS do 1080p (ze względu na przewijanie); jeśli brak takiego wariantu, dopuszcza pozostałe formaty, w tym HLS; słabsze materiały są powiększane z zachowaniem proporcji i czarnymi pasami (np. po bokach dla 4:3).
-- Filmy VOD są odczytywane z ograniczonym zapasem: osobna kolejka przechowuje do **3 gotowych segmentów (zwykle 12 s, maksymalnie 24 MiB)** przed publikacją. FFmpeg może ją szybko uzupełnić, ale pełna kolejka wstrzymuje upload; aplikacja nie pobiera całego filmu z wyprzedzeniem. Osobne zadanie publikuje segmenty według zegara, więc player nie zużywa tego zapasu przez start przy końcu playlisty. Transmisje źródłowe live nadal są odczytywane w czasie rzeczywistym.
-- Do 20 sekund przed końcem filmu aplikacja może odczytać metadane/adresy kolejnego źródła. Ten odczyt jest anulowany po wygaśnięciu widzów; dane usuniętego źródła nie są używane przy przejściu.
-- Segment trwa zwykle 4 sekundy. Playlisty HLS udostępniają ostatnich 6 segmentów, starsze są krótko przechowywane dla klientów. Granice materiałów mają `EXT-X-DISCONTINUITY`, a globalna numeracja segmentów nie cofa się.
-- Zegar kanału startuje po odczytaniu pierwszego źródła i biegnie również bez widzów. Pierwszy widz uruchamia ekstrakcję i FFmpeg z przewinięciem do aktualnej pozycji programu. Kolejni dołączają do tego samego producenta. Na start kanał wysyła planszę **LOADING…** z ciszą (H.264/AAC 1080p, wideo CBR 3000 kb/s z wypełnieniem HRD, również dla statycznego obrazu), także do zewnętrznych odtwarzaczy IPTV. Pierwsze dwa segmenty planszy generowane są w przyspieszonym tempie w RAM, równolegle z ekstrakcją źródła, a kolejne w tempie odtwarzania. Pierwszy gotowy segment filmu kończy generator planszy; przejście używa `EXT-X-DISCONTINUITY`. Odtwarzacz może jeszcze wyświetlić wcześniej zbuforowaną planszę. Plansza nie zatrzymuje zegara kanału ani nie skraca ekstrakcji. HLS wprowadza kilkunastosekundowe opóźnienie.
-- HLS składa się z krótkich zapytań HTTP, więc zakończenie oglądania jest rozpoznawane po braku kolejnych żądań. Domyślnie **25 sekund** po ostatnim żądaniu manifestu/segmentu kanał zatrzymuje procesy i zwalnia RAM (`IDLE_SECONDS`). Aktywne oczekiwanie na pierwszy manifest utrzymuje start; po rozłączeniu żądania lub 90 sekundach timeoutu jest kończone. Samo API statusu nie przedłuża emisji.
-- Licznik widzów pokazuje aktywne sesje HLS, a nie zweryfikowaną liczbę osób. Nietypowe klienty odrzucające URL po przekierowaniu mogą zawyżać ten licznik do wygaśnięcia sesji.
-- Punkt startu zegara, katalog programów i seed losowania są przechowywane jako metadane w SQLite. Po restarcie bieżąca pozycja jest obliczana z czasu rzeczywistego, także po przejściu przez wiele cykli bez widzów. Sam zegar nie uruchamia yt-dlp ani FFmpeg i nie pobiera mediów.
-- Przykład: film A ma 10 minut i zaczyna się o 12:00. Widz dołączający o 12:02 dostaje materiał przewinięty do około 02:00, z uwzględnieniem czasu ekstrakcji i zwykłego opóźnienia HLS. Po zakończeniu A zegar przechodzi do następnego filmu nawet wtedy, gdy nikt nie ogląda. Segmenty mają `EXT-X-PROGRAM-DATE-TIME`.
-- Losowanie odbywa się bez powtórzeń w obrębie cyklu. Identyczne adresy materiałów z nakładających się playlist są deduplikowane. Na granicy cyklu nie ma natychmiastowej powtórki, jeśli są inne materiały.
-- Dodanie źródła nie cofa bieżącego slotu; usunięcie stosuje wybraną politykę kończenia filmu. Przyszła rotacja jest przeliczana z nowej puli. Domyślnie usunięcie lub wyłączenie źródła zatrzymuje także bieżący materiał, anuluje jego ekstrakcję/FFmpeg, usuwa stare segmenty i przebudowuje kolejkę. Przełącznik **Finish the current video when its source is removed** pozwala dokończyć wyłącznie aktualny film; reszta usuniętej playlisty nie wróci do kolejki. Ustawienie jest zapisywane w SQLite i domyślnie wyłączone. Podgląd WWW resetuje swój bufor po zmianie rewizji streamu (najpóźniej przy kolejnym odczycie statusu, co 2 s). Zewnętrzny odtwarzacz IPTV może jeszcze odtworzyć bajty pobrane wcześniej do własnego bufora — serwer nie może ich wycofać. Materiał obecny również w innym włączonym źródle pozostaje dostępny. Playlistę można ponownie odczytać przyciskiem ↻. Limit odczytu to pierwsze 500 pozycji (`MAX_PLAYLIST_ITEMS`).
-- Niedostępny materiał jest ponawiany z rosnącym odstępem; zegar biegnie dalej i po końcu jego slotu przechodzi do następnego programu. Powolny serwis źródłowy lub błąd ekstrakcji może spowodować przerwę w odtwarzaniu; aplikacja nie przechowuje zapasowych filmów na dysku. Dokładna ramówka wymaga długości filmów w metadanych yt-dlp. Dla nieznanej długości aplikacja rezerwuje tymczasowo godzinny slot (oznaczony `~` w panelu); długość może zostać skorygowana podczas aktywnego odtwarzania po ekstrakcji lub dojściu do końca filmu. Bez długości materiału nie da się dokładnie wyznaczyć granic kolejnych programów bez dostępu do mediów. Transmisje live otwierane są na ich bieżącej krawędzi, bez przewijania; slot jest ograniczony dostępnymi metadanymi lub godziną.
+- yt-dlp uses `--skip-download` and `--no-cache-dir`. FFmpeg reads the URLs returned by yt-dlp directly, including separate YouTube audio and video tracks.
+- No video or HLS segment is stored as a file. FFmpeg uploads segments to a loopback endpoint protected by a random secret, and the application keeps the bytes in RAM.
+- The published buffer is limited to 12 segments / 64 MiB, with an 8 MiB limit per segment. A separate queue for segments waiting for the manifest is bounded too. These limits cover media buffers, not the complete Python, extractor, or FFmpeg RSS.
+- Output is always 1920×1080 / 25 fps. yt-dlp prefers a direct HTTPS stream up to 1080p for seeking and falls back to other formats, including HLS. Smaller sources are scaled with aspect ratio preserved and black padding where needed.
+- VOD is read with limited look-ahead: up to 3 ready segments, usually 12 seconds and at most 24 MiB, are held before publication. A full queue pauses the upload, so the application does not download the whole video in advance. Live sources are read in real time.
+- Up to 20 seconds before a video ends, the next source may be prepared. That work is cancelled when viewers disappear, and removed sources are not used during the transition.
+- Segments are usually 4 seconds long. HLS playlists expose the latest 6 segments, while older segments remain briefly available for clients. Programme boundaries use `EXT-X-DISCONTINUITY`, and the global media sequence never moves backwards.
+- The channel clock starts after the first source is read and continues without viewers. The first viewer starts extraction and FFmpeg at the current programme position; later viewers join the same producer. A `LOADING…` slate with silent H.264/AAC 1080p output is sent while the first video is prepared.
+- HLS activity is used to detect when viewing ends. By default, the channel stops its processes and releases RAM 25 seconds after the last manifest or segment request (`IDLE_SECONDS`). The status API does not keep the broadcast alive.
+- The viewer count represents active HLS sessions, not a verified number of people. Some clients can temporarily inflate it by abandoning redirected URLs.
+- The clock origin, programme catalogue, and shuffle seed are stored as SQLite metadata. After a restart, the current position is calculated from wall-clock time, even if multiple cycles passed without viewers.
+- Shuffle has no repeats within a cycle. Duplicate URLs across overlapping playlists are deduplicated, and the next cycle avoids an immediate repeat when other items are available.
+- Adding a source does not move the current slot. Removing or disabling a source stops the current programme by default, cancels extraction and FFmpeg, removes old segments, and rebuilds the queue. **Finish the current video when its source is removed** can preserve the current video; it is stored in SQLite and disabled by default.
+- Unavailable media is retried with increasing delays while the clock continues. Unknown durations receive a temporary one-hour slot, marked with `~` in the console, and can be corrected during playback. Live sources start at their current edge without seeking.
 
-## Wersje yt-dlp
+## yt-dlp releases
 
-Panel pobiera z GitHuba ostatnie 25 wydań z oficjalnych repozytoriów stable i nightly. „Najnowsza dostępna” rozwiązuje się do konkretnego tagu. Można przełączyć gałąź, zaktualizować lub wrócić z nightly do stable.
+The console fetches the latest 25 releases from the official stable and nightly repositories. **Latest available** resolves to a concrete tag, and you can switch channels, install a release, or return from nightly to stable.
 
-Instalator pobiera oficjalny Python zipapp `yt-dlp` i `SHA2-256SUMS` przez HTTPS, weryfikuje SHA-256, uruchamia `--version`, a dopiero potem atomowo zapisuje wybór. Niepowodzenie zostawia poprzednią wersję aktywną. Rozpoczęte procesy kończą pracę ze swoją wersją; nowe używają wybranej. Wersje są przechowywane w `/data/versions`; nie są to pliki multimedialne. Aplikacja nie wykonuje dowolnych komend z interfejsu.
+The installer downloads the official Python zipapp and `SHA2-256SUMS` over HTTPS, verifies SHA-256, runs `--version`, and only then atomically activates the selection. A failed install leaves the previous release active. Existing processes finish with their current version; new jobs use the selected version. Releases live in `/data/versions`, which contains no media files.
 
-Obraz zawiera początkowe stable przypięte w `uv.lock`, zależności yt-dlp, komponent EJS oraz Deno do obsługi wyzwań JavaScript. Przełączenie zipappa nie aktualizuje Deno ani zależności EJS — gdy przyszłe wydanie podniesie ich wymagania, trzeba zaktualizować lock/obraz. API GitHuba podlega limitom; lista jest cache'owana przez 5 minut, a błędy są widoczne w panelu.
+The image includes the initial stable release pinned in `uv.lock`, yt-dlp dependencies, the EJS component, and Deno for JavaScript challenges. Switching the zipapp does not update Deno or EJS dependencies. GitHub API results are cached for 5 minutes, and errors appear in the console.
 
-Dostępność materiału nadal zależy od źródłowego serwisu. Blokady IP, logowanie, ograniczenia geograficzne, DRM lub zmiany YouTube mogą uniemożliwić ekstrakcję. Aktualizacja nightly może pomóc w zmianach ekstraktora, ale nie omija ograniczeń dostępu. Obecna wersja UI nie zarządza cookies ani kontami serwisów.
+Availability still depends on the source service. IP blocks, login requirements, geographic restrictions, DRM, or extractor changes can prevent extraction. Nightly may help with extractor changes but cannot bypass access restrictions. The current UI does not manage cookies or service accounts.
 
-## VAAPI / QSV
+## Hardware encoding
 
-Domyślnie działa kodowanie CPU (`libx264`). Opcjonalnie:
+CPU encoding (`libx264`) is enabled by default. For VAAPI:
 
 ```bash
 stat -c '%g' /dev/dri/renderD128 /dev/dri/card0
-# Wpisz odpowiednie RENDER_GID i VIDEO_GID w .env
-ENCODER=vaapi sudo -E docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
+# Put the matching RENDER_GID and VIDEO_GID values in .env
+ENCODER=vaapi docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
 ```
 
-W praktyce najwygodniej ustawić `ENCODER=vaapi` w `.env`. Dla Intel Quick Sync użyj `ENCODER=qsv`. `VAAPI_DEVICE` pozwala wskazać inne urządzenie renderujące. Plik `compose.gpu.yaml` przekazuje `/dev/dri` i dodatkowe grupy urządzenia; nie wymaga kontenera uprzywilejowanego. W obrazie są sterowniki Mesa VAAPI i Intel Media.
+For Intel Quick Sync, use `ENCODER=qsv`. `VAAPI_DEVICE` selects another render device. `compose.gpu.yaml` passes `/dev/dri` and the device groups without requiring a privileged container. The image includes Mesa VAAPI and Intel Media drivers.
 
-Sprzętowe jest kodowanie; dekodowanie i skalowanie pozostają programowe, aby obsługiwać mieszane formaty źródłowe. Niewspierany sprzęt/sterownik daje błąd w dzienniku — wtedy wróć do `software`. Tryby GPU wymagają weryfikacji na docelowym hoście. W środowisku przygotowania sprawdzono pełną ścieżkę HLS/Chromium zarówno na CPU, jak i VAAPI; QSV zwróciło błąd inicjalizacji sesji MFX, więc nie jest tu potwierdzone.
+Hardware acceleration covers encoding. Decoding and scaling remain software-based so mixed source formats work. GPU modes must be verified on the target host. VAAPI was validated through the full HLS/Chromium path; QSV returned an MFX session initialization error in the preparation environment.
 
-## Rozwój
+## Development
 
-Python / FastAPI / SQLite, natywne moduły JS i lokalnie dostarczany hls.js. Brak zależności runtime od CDN. Jeden worker Uvicorn jest wymagany, ponieważ producent i bufory są współdzielone w pamięci tego procesu.
-
-| Moduł | Odpowiedzialność |
-| --- | --- |
-| `app/sources.py` | Jedyna ścieżka wejściowa: ekstrakcja przez yt-dlp |
-| `app/versions.py` | Wydania, weryfikacja, atomowe przełączanie |
-| `app/engine.py` | Producent kanału, przewijanie wejść, HLS w RAM |
-| `app/buffer.py` | Ograniczony zapas segmentów i publikacja według czasu programu |
-| `app/slate.py` | Plansza startowa HLS w RAM, generowana tylko dla aktywnej sesji |
-| `app/timeline.py` | Trwały zegar ramówki, losowanie cykli, bieżący program i offset |
-| `app/db.py` | Kanały, źródła, materiały i ustawienia |
-| `app/main.py` | API, lifecycle, autoryzacja, endpointy IPTV |
-| `app/static/` | Panel, moduły API/odtwarzacza, responsywne style |
-
-Model danych już rozdziela kanały od źródeł i materiałów; obecne API/UI udostępnia tylko kanał `main`. Kolejne kanały wymagają rejestru instancji `Channel`, dynamicznych tras i CRUD kanałów. Własną kolejność można wprowadzić jako nową strategię w `Timeline`. XMLTV może wykorzystać sloty `Timeline`, ale wymaga osobnego eksportera i kompletnej metadanej długości; **nie jest jeszcze zaimplementowane**. Każda taka rozbudowa ma zachować yt-dlp jako jedyny sposób interpretacji źródeł. Nie ma skanera lokalnych plików ani bibliotek Plex/Jellyfin.
-
-Lokalnie (Python 3.11+, FFmpeg z libx264 i drawtext, font DejaVu Sans, Node lub Deno):
+The stack is Python 3.11+, FastAPI, Uvicorn, SQLite, yt-dlp, FFmpeg, native JavaScript modules, and a locally served hls.js. There is no runtime CDN dependency. Run exactly one Uvicorn worker because the producer and buffers are shared in that process.
 
 ```bash
 uv sync --extra test
@@ -109,9 +124,23 @@ npm ci && npm run vendor
 DATA_DIR=.data uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
-Nie zmieniaj portu samego Uvicorna bez ustawienia identycznego `PORT` — FFmpeg przesyła segmenty na ten port przez loopback. Docker ustawia obie wartości wspólnie.
+Keep the Uvicorn port and `PORT` identical: FFmpeg uploads segments to that port over loopback. Docker configures both together.
 
-Testy:
+| Module | Responsibility |
+| --- | --- |
+| `app/sources.py` | The only source input path: yt-dlp extraction |
+| `app/versions.py` | Releases, verification, and atomic switching |
+| `app/engine.py` | Channel producer, input seeking, and in-memory HLS |
+| `app/buffer.py` | Bounded segment reserve and programme-time publication |
+| `app/slate.py` | In-memory loading slate for active sessions |
+| `app/timeline.py` | Persistent clock, shuffle cycles, programme, and offset |
+| `app/db.py` | Channels, sources, media items, and settings |
+| `app/main.py` | API, lifecycle, authorization, and IPTV endpoints |
+| `app/static/` | Console, player/API modules, and responsive styles |
+
+The data model separates channels, sources, and media items, but the current API and UI expose only the `main` channel. Multiple channels, custom ordering, and XMLTV require additional implementation. Any extension should keep yt-dlp as the only source interpreter; local media scanners and Plex/Jellyfin libraries are not supported.
+
+## Testing
 
 ```bash
 uv run pytest -q
@@ -120,70 +149,43 @@ mkdir -p artifacts
 node scripts/ui-check.mjs
 ```
 
-Test pełnej ścieżki na **osobnym pustym kontenerze** (sam generuje dwie krótkie próbki audio/video, bez pobierania filmów):
+Run integration scripts only against an isolated, empty test instance. They modify sources and settings, and some stop or suspend FFmpeg. Example:
 
 ```bash
-sudo docker run -d --name tube-iptv-test -p 8001:8000 \
+docker run -d --name tube-iptv-test -p 8001:8000 \
   --add-host host.docker.internal:host-gateway --read-only \
   --tmpfs /tmp:rw,size=64m,mode=1777 -e IDLE_SECONDS=25 tube-iptv:local
 BROWSER_CHECK=1 uv run python scripts/smoke.py
-sudo docker rm -fv tube-iptv-test
+docker rm -fv tube-iptv-test
 ```
 
-Test sprawdza prawdziwy yt-dlp i FFmpeg, współdzielenie osi czasu, kodeki przez ffprobe, przejścia HLS, odtwarzanie w Chromium oraz zatrzymanie i zwolnienie bufora. Port 8766 udostępnia na czas testu lokalne próbki kontenerowi. `TUBE_URL` i `FIXTURE_HOST` pozwalają zmienić adresy.
+The full-path smoke test generates short local audio/video fixtures, exercises real yt-dlp and FFmpeg, checks codecs with ffprobe, verifies HLS transitions and Chromium playback, and checks that the buffer stops and is released. `TUBE_URL` and `FIXTURE_HOST` can override its addresses.
 
-Eksport obrazu:
+Additional checks include `scripts/timeline-check.py`, `scripts/removal-check.py`, `scripts/loading-check.py`, and `scripts/buffer-check.py`. Read the script headers before running them; several expect a separate test container and local fixture ports.
+
+## Diagnostics and upload ordering
+
+`docker compose logs -f` reports extraction time, the first complete segment, reserve readiness, interrupted uploads, and FFmpeg warnings. The same recent measurements are available under `diagnostics` in `GET /api/status`. URLs in FFmpeg warnings are redacted so signed CDN URLs are not logged.
+
+FFmpeg manifests and segments can arrive over different connections and in any order. The server publishes a segment only after receiving both its metadata and complete body, preserving input order. A lost upload creates a discontinuity while retaining its position on the programme timeline.
+
+The internal upload receiver listens only on `127.0.0.1`, chooses a random port, and checks the channel secret. It uses persistent HTTP connections and `100 Continue`, allowing FFmpeg to upload only when the buffer has room. The receiver completes full requests after the sending page closes without writing media to disk.
+
+The next clip begins no earlier than the end of the previous segment. Recovery resumes after the end of already accepted data, including data waiting in RAM; it does not seek back to the wall-clock position. If a source ends early, the existing schedule order is preserved.
+
+## Exporting the image
 
 ```bash
-sudo docker save tube-iptv:local | gzip > tube-iptv.tar.gz
-# Na innym hoście:
-gunzip -c tube-iptv.tar.gz | sudo docker load
+docker save tube-iptv:local | gzip > tube-iptv.tar.gz
+# On another host:
+gunzip -c tube-iptv.tar.gz | docker load
 ```
 
-## Dokumentacja wykorzystanych projektów
+## Related projects
 
-- [yt-dlp: instalacja, wydania i opcje](https://github.com/yt-dlp/yt-dlp#readme)
-- [FFmpeg: muxer HLS, publikowanie przez HTTP PUT](https://ffmpeg.org/ffmpeg-formats.html#hls-2)
-- [hls.js: odtwarzacz przeglądarkowy](https://github.com/video-dev/hls.js)
-- [Tunarr: architektury transmisji i transkodowanie](https://tunarr.com/configure/transcoding/) — punkt odniesienia dla kanału współdzielonego; Tube ma odrębną implementację i źródła wyłącznie yt-dlp.
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — extraction, releases, and options
+- [FFmpeg HLS documentation](https://ffmpeg.org/ffmpeg-formats.html#hls-2) — HLS muxing and HTTP PUT publishing
+- [hls.js](https://github.com/video-dev/hls.js) — browser playback
+- [Tunarr](https://tunarr.com/configure/transcoding/) — reference architecture for shared channels and transcoding
 
-Test zegara i rzeczywistego przewijania (tylko na pustym, testowym kontenerze):
-
-```bash
-TEST_CONTAINER=tube-iptv-test uv run python scripts/timeline-check.py
-```
-
-Test przesuwa zapisany zegar o 120 sekund, restartuje testowy kontener, dekoduje pierwszą klatkę HLS i sprawdza jej kolor. Następnie wygasza transmisję i sprawdza ponowne dołączenie bez cofania programu. Używa wygenerowanego lokalnie filmu oraz portu 8767; nie pobiera filmów testowych z YouTube.
-
-## Diagnostyka startu i segmentów
-
-`docker compose logs -f` pokazuje czas ekstrakcji, pierwszy kompletny segment, gotowość dwóch segmentów, przerwane uploady i ostrzeżenia FFmpeg. Te same ostatnie pomiary są w `GET /api/status` → `diagnostics`. Adresy HTTP z ostrzeżeń FFmpeg są redagowane, aby nie zapisywać podpisanych URL-i CDN.
-
-Manifest FFmpeg i segment mogą docierać różnymi połączeniami, w dowolnej kolejności. Serwer publikuje segment dopiero po otrzymaniu **zarówno metadanych, jak i całego body**, zachowując kolejność wejściową. Utracony upload oznacza discontinuity i zachowanie jego miejsca na osi czasu.
-
-Wewnętrzny odbiornik uploadów słucha wyłącznie na `127.0.0.1`, na automatycznie wybranym porcie, i sprawdza sekret kanału. Używa trwałych połączeń HTTP oraz `100 Continue`: FFmpeg dostaje zgodę na przesłanie segmentu dopiero, gdy jest miejsce w buforze. Stała lokalna nazwa użytkownika `upload` w URL uruchamia ten handshake w FFmpeg 5; nie jest hasłem ani sposobem autoryzacji. Samo keep-alive nie zapewniało poprawnego hamowania producenta. Odbiornik doczytuje kompletne żądania również po zamknięciu strony nadawczej, bez zapisu materiału na dysk. Po zakończeniu FFmpeg aplikacja czeka na końcową playlistę `ENDLIST` i przyjęcie jej segmentów do RAM, ale nie czeka na opróżnienie kolejki emisji przed przygotowaniem kolejnego źródła.
-
-Segment kolejnego klipu zaczyna się najwcześniej po końcu poprzedniego segmentu. Recovery wznawia od końca już przyjętych danych, również tych oczekujących w RAM; nie przewija ponownie do pozycji zegara. Wcześniejsze zakończenie źródła przesuwa istniejącą kolejność harmonogramu zamiast rozpoczynać ją od pierwszych utworów.
-
-Test usuwania aktywnego źródła, kończenia ostatniego filmu oraz dużych segmentów:
-
-```bash
-# Na pustej, osobnej instancji pod portem 8001:
-uv run python scripts/removal-check.py
-```
-
-Test planszy startowej i skalowania 4:3 do 1080p (pusty kontener testowy):
-
-```bash
-uv run python scripts/loading-check.py
-```
-
-Test używa celowo opóźnionego źródła HTTP na porcie 8769, sprawdza zdekodowane piksele w Chromium i zapisuje zrzuty planszy oraz filmu w `artifacts/`.
-
-Test odporności na przerwę producenta (wyłącznie pusty kontener testowy; zatrzymuje jego FFmpeg na 6 sekund):
-
-```bash
-TEST_CONTAINER=tube-iptv-test uv run python scripts/buffer-check.py
-```
-
-Diagnostyka `/api/status` pokazuje `reserve_segments`, `reserve_seconds`, `reserve_bytes` oraz bieżący i maksymalny odstęp między publikacjami. Zapas nie gwarantuje ciągłości przy przerwie dłuższej niż dostępne segmenty ani przy problemach połączenia od serwera do odtwarzacza.
+Tube IPTV has its own implementation and accepts sources through yt-dlp only.

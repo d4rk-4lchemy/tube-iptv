@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">Tube IPTV logo</title>
+  <desc id="desc">A dark T on a lime rounded square</desc>
+  <rect width="256" height="256" rx="48" fill="#d8f36a"/>
+  <path d="M64 72h128v36h-44v96h-40v-96H64z" fill="#1c2520"/>
+</svg>
