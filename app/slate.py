@@ -4,6 +4,7 @@ import secrets
 import time
 from . import config
 from .process import stop_process
+from .video import RESOLUTIONS
 
 
 class LoadingSlate:
@@ -60,12 +61,14 @@ class LoadingSlate:
 
     async def run(self):
         destination = f'{self.channel.upload_base}/{self.clip}'
+        width, height, _, _ = RESOLUTIONS[self.channel.resolution]
+        fps = 60 if self.channel.fps == 'original' else self.channel.fps
         command = ['ffmpeg', '-hide_banner', '-nostdin', '-loglevel', 'error',
-                   '-f', 'lavfi', '-i', 'color=c=black:s=1920x1080:r=25',
+                   '-f', 'lavfi', '-i', f'color=c=black:s={width}x{height}:r={fps}',
                    '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
-                   '-vf', "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:text='LOADING...':fontcolor=white:fontsize=54:x=(w-tw)/2:y=(h-th)/2",
+                   '-vf', f"drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:text='LOADING...':fontcolor=white:fontsize={height // 20}:x=(w-tw)/2:y=(h-th)/2",
                    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
-                   '-threads', '2', '-filter_threads', '1', '-g', '100', '-keyint_min', '100',
+                   '-threads', '2', '-filter_threads', '1', '-g', str(fps * 4), '-keyint_min', str(fps * 4),
                    # HRD filler makes even a static black frame consume the requested bitrate.
                    '-b:v', '3000k', '-minrate', '3000k', '-maxrate', '3000k', '-bufsize', '3000k',
                    '-x264-params', 'nal-hrd=cbr:filler=1',

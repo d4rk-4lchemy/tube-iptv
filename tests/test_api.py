@@ -55,6 +55,126 @@ async def test_internal_ingest_is_private(client):
     assert response.status_code == 403
 
 
+async def test_channels_isolate_sources_settings_streams_and_cleanup(client, monkeypatch):
+    from app.engine import Segment
+    def refresh(source):
+        app.state.db.replace_media(source['id'], 'Video', [
+            {'url': source['url'], 'title': 'Video', 'duration': 600}])
+    monkeypatch.setattr(app.state.sources, 'refresh', refresh)
+    response = await client.post('/api/channels', json={'name': 'Second'})
+    assert response.status_code == 201
+    second = response.json()['id']
+    other = app.state.channels[second]
+    main = app.state.channels['main']
+    assert other.sources is main.sources is app.state.sources
+    assert other.upload_base != main.upload_base
+    url = {'url': 'https://example.com/shared'}
+    a = (await client.post('/api/sources', json=url)).json()['id']
+    b = (await client.post(f'/api/channels/{second}/sources', json=url)).json()['id']
+    assert a != b
+    app.state.db.update_duration(second, url['url'], 900)
+    assert app.state.db.media(second)[0]['duration'] == 900
+    assert app.state.db.media('main')[0]['duration'] == 600
+    assert (await client.post(f'/api/channels/{second}/sources', json=url)).status_code == 409
+    await client.patch(f'/api/channels/{second}/settings', json={'finish_current_on_remove': True})
+    assert other.finish_current_on_remove and not main.finish_current_on_remove
+    first_status = (await client.get('/api/status')).json()
+    second_status = (await client.get(f'/api/channels/{second}/status')).json()
+    assert [s['id'] for s in first_status['sources']] == [a]
+    assert [s['id'] for s in second_status['sources']] == [b]
+    assert main.timeline.key != other.timeline.key
+    assert main.task is None and other.task is None
+    playlist = (await client.get('/playlist.m3u8')).text
+    assert playlist.count('#EXTINF:') == 2 and f'/channels/{second}/index.m3u8' in playlist
+    assert (await client.get(f'/channels/{second}/index.m3u8')).status_code == 307
+    assert other.task is None
+    async def producer():
+        await asyncio.Event().wait()
+    monkeypatch.setattr(other, 'run', producer)
+    other.segments.append(Segment(0, 'clip', 4, b'second', 0))
+    assert (await client.get('/channels/main/segments/0.ts')).status_code == 404
+    assert (await client.get(f'/channels/{second}/segments/0.ts')).content == b'second'
+    assert other.task is not None and main.task is None
+    task, clock, uploads = other.task, other.clock_task, app.state.uploads[second]
+    assert (await client.delete(f'/api/channels/{second}')).status_code == 204
+    assert task.done() and clock.done() and not uploads.server.is_serving()
+    assert not other.segments and not app.state.db.sources(second)
+    assert app.state.db.setting(f'timeline:{second}') is None
+    assert len(app.state.db.sources('main')) == 1
+    assert (await client.get(f'/channels/{second}/index.m3u8')).status_code == 404
+    assert (await client.delete('/api/channels/main')).status_code == 409
+
+
+async def test_channel_validation_and_auth(client, monkeypatch):
+    for name in ['', '   ', 'bad\nname', '<script>']:
+        assert (await client.post('/api/channels', json={'name': name})).status_code == 422
+    assert (await client.get('/api/channels/missing/status')).status_code == 404
+    assert (await client.post('/api/channels/missing/sources', json={'url': 'https://example.com/v'})).status_code == 404
+    monkeypatch.setattr(config, 'ADMIN_PASSWORD', 'secret')
+    assert (await client.post('/api/channels', json={'name': 'Private'})).status_code == 401
+    assert (await client.delete('/api/channels/main')).status_code == 401
+    assert (await client.post('/api/channels', json={'name': 'Private'}, auth=('admin', 'secret'),
+                              headers={'Origin': 'https://evil.example'})).status_code == 403
+
+
+async def test_delete_channel_cancels_refresh_and_waiting_manifest(client, monkeypatch):
+    second = (await client.post('/api/channels', json={'name': 'Waiting'})).json()['id']
+    channel = app.state.channels[second]
+    started = asyncio.Event()
+    async def blocked(*args):
+        started.set()
+        await asyncio.Event().wait()
+    monkeypatch.setattr(app.state.sources, '_refresh', blocked)
+    response = await client.post(f'/api/channels/{second}/sources', json={'url': 'https://example.com/v'})
+    source = response.json()['id']
+    await started.wait()
+    refresh_task = app.state.sources.tasks[source]
+    app.state.db.replace_media(source, 'V', [{'url': 'https://example.com/v', 'title': 'V', 'duration': 600}])
+    monkeypatch.setattr(channel, 'run', blocked)
+    manifest = asyncio.create_task(client.get(f'/channels/{second}/index.m3u8?viewer=waiting'))
+    try:
+        async with asyncio.timeout(2):
+            while not channel.waiters:
+                await asyncio.sleep(.01)
+        assert (await client.delete(f'/api/channels/{second}')).status_code == 204
+        assert (await asyncio.wait_for(manifest, 2)).status_code == 404
+        assert refresh_task.cancelled() and channel.waiters == 0 and channel.task is None
+        await channel.touch('late-viewer')
+        assert channel.task is None
+    finally:
+        manifest.cancel()
+        await asyncio.gather(manifest, return_exceptions=True)
+
+
+async def test_legacy_removal_setting_only_applies_to_main(client):
+    app.state.db.set_setting('finish_current_on_remove', True)
+    second = (await client.post('/api/channels', json={'name': 'New'})).json()['id']
+    assert app.state.channels['main'].finish_current_on_remove
+    assert not app.state.channels[second].finish_current_on_remove
+    await client.patch('/api/settings', json={'finish_current_on_remove': False})
+    assert not app.state.channels['main'].finish_current_on_remove
+
+
+async def test_channels_and_timeline_survive_restart_without_restoring_deleted_main(client):
+    second = (await client.post('/api/channels', json={'name': 'Persisted'})).json()['id']
+    app.state.db.execute('INSERT INTO sources(id,channel_id,url) VALUES(?,?,?)',
+                         ('persisted', second, 'https://example.com/v'))
+    app.state.db.replace_media('persisted', 'V', [{'url': 'https://example.com/v', 'title': 'V', 'duration': 600}])
+    app.state.channels[second].scheduled()
+    saved = app.state.db.setting(f'timeline:{second}')
+    assert (await client.delete('/api/channels/main')).status_code == 204
+    reopened = db.Database()
+    try:
+        assert reopened.rows('SELECT id FROM channels') == [{'id': second}]
+        from app.engine import Channel
+        restored = Channel(second, reopened, app.state.sources)
+        assert restored.timeline.state == saved
+        assert restored.scheduled().starts_at == saved['epoch']
+        assert restored.task is None
+    finally:
+        reopened.conn.close()
+
+
 async def playing_fixture(monkeypatch, with_other=False):
     from types import SimpleNamespace
     from app.engine import Segment
@@ -171,3 +291,126 @@ async def test_upload_disconnect_is_reported_without_publishing_partial_media(cl
     assert response.status_code == 499
     assert not channel.pending and not channel.segments
     assert channel.metrics['upload_aborts'] == 1
+
+
+async def test_channel_fps_is_partial_persistent_and_isolated(client):
+    from app.engine import Channel
+    main = app.state.channel
+    assert (await client.get('/api/status')).json()['fps'] == 60
+    second = (await client.post('/api/channels', json={'name': 'Native'})).json()['id']
+    path = f'/api/channels/{second}/settings'
+    for fps in [24, 25, 30, 50, 60, 'original']:
+        response = await client.patch(path, json={'fps': fps})
+        assert response.status_code == 200
+        assert response.json()['fps'] == fps
+        assert (await client.get(f'/api/channels/{second}/status')).json()['fps'] == fps
+        assert main.fps == 60
+    await client.patch(path, json={'finish_current_on_remove': True})
+    assert app.state.channels[second].fps == 'original'
+    await client.patch(path, json={'fps': 25})
+    assert app.state.channels[second].finish_current_on_remove
+    assert app.state.channels[second].task is None
+    reopened = db.Database()
+    try:
+        restored = Channel(second, reopened, app.state.sources)
+        assert restored.fps == 25
+    finally:
+        reopened.conn.close()
+    await client.delete(f'/api/channels/{second}')
+    assert app.state.db.setting(f'fps:{second}') is None
+
+
+@pytest.mark.parametrize('fps', [None, True, 0, -1, 26, 1000, '60', 'auto', 'nan'])
+async def test_invalid_fps_is_rejected_without_changing_settings(client, fps):
+    response = await client.patch('/api/settings', json={'fps': fps, 'finish_current_on_remove': True})
+    assert response.status_code == 422
+    assert app.state.channel.fps == 60
+    assert not app.state.channel.finish_current_on_remove
+
+
+async def test_fps_update_keeps_current_producer_and_schedule(client, monkeypatch):
+    channel, stopped = await playing_fixture(monkeypatch)
+    task, slot = channel.task, channel.scheduled()
+    response = await client.patch('/api/settings', json={'fps': 'original'})
+    assert response.status_code == 200 and channel.fps == 'original'
+    assert channel.task is task and not stopped.is_set()
+    assert len(channel.segments) == 2
+    assert channel.scheduled().key == slot.key
+
+
+async def test_fps_settings_require_auth_and_same_origin(client, monkeypatch):
+    monkeypatch.setattr(config, 'ADMIN_PASSWORD', 'secret')
+    path = '/api/channels/main/settings'
+    assert (await client.patch(path, json={'fps': 25})).status_code == 401
+    response = await client.patch(path, json={'fps': 25}, auth=('admin', 'secret'),
+                                  headers={'Origin': 'https://evil.example'})
+    assert response.status_code == 403
+    assert app.state.channel.fps == 60
+
+
+async def test_resolution_is_persistent_isolated_and_removed_with_channel(client):
+    from app.engine import Channel
+    second = (await client.post('/api/channels', json={'name': '4K'})).json()['id']
+    path = f'/api/channels/{second}/settings'
+    assert (await client.get('/api/status')).json()['resolution'] == '1080p'
+    for resolution in ['480p', '720p', '1080p', '4k']:
+        response = await client.patch(path, json={'resolution': resolution})
+        assert response.status_code == 200
+        assert response.json()['resolution'] == resolution
+        assert (await client.get(f'/api/channels/{second}/status')).json()['resolution'] == resolution
+        assert app.state.channel.resolution == '1080p'
+    await client.patch(path, json={'fps': 25})
+    reopened = db.Database()
+    try:
+        restored = Channel(second, reopened, app.state.sources)
+        assert restored.resolution == '4k' and restored.fps == 25
+    finally:
+        reopened.conn.close()
+    await client.delete(f'/api/channels/{second}')
+    assert app.state.db.setting(f'resolution:{second}') is None
+
+
+@pytest.mark.parametrize('resolution', [None, True, 480, '2160p', '8k', 'original'])
+async def test_invalid_resolution_is_atomic(client, resolution):
+    response = await client.patch('/api/settings', json={'resolution': resolution, 'fps': 25})
+    assert response.status_code == 422
+    assert app.state.channel.resolution == '1080p' and app.state.channel.fps == 60
+
+
+async def test_resolution_change_preserves_current_playback(client, monkeypatch):
+    channel, stopped = await playing_fixture(monkeypatch)
+    task, slot = channel.task, channel.scheduled()
+    response = await client.patch('/api/settings', json={'resolution': '4k'})
+    assert response.status_code == 200
+    assert channel.task is task and not stopped.is_set()
+    assert len(channel.segments) == 2 and channel.scheduled().key == slot.key
+
+
+async def test_gpu_settings_validate_before_saving_and_apply_globally(client, monkeypatch):
+    from app import gpu
+    monkeypatch.setattr(gpu, 'inventory', lambda: [
+        {'id': '/dev/dri/renderD129', 'label': 'AMD', 'encoders': ['vaapi'], 'accessible': True}])
+    assert (await client.get('/api/gpu')).json()['devices'][0]['label'] == 'AMD'
+    original = gpu.settings(app.state.db)
+    for payload in [{'encoder': 'qsv', 'device': '/dev/dri/renderD129'},
+                    {'encoder': 'vaapi', 'device': '/tmp/device'}, {'encoder': 'invalid'}]:
+        assert (await client.patch('/api/gpu', json=payload)).status_code == 422
+        assert gpu.settings(app.state.db) == original
+    checked = []
+    monkeypatch.setattr(gpu, 'validate', lambda encoder, device: checked.append((encoder, device)))
+    payload = {'encoder': 'vaapi', 'device': '/dev/dri/renderD129'}
+    assert (await client.patch('/api/gpu', json=payload)).json() == payload
+    assert checked == [('vaapi', '/dev/dri/renderD129')]
+    assert app.state.db.setting('gpu_engine') == payload
+    second = (await client.post('/api/channels', json={'name': 'Second'})).json()['id']
+    for channel_id in ['main', second]:
+        assert (await client.get(f'/api/channels/{channel_id}/status')).json()['encoder'] == 'vaapi'
+    assert (await client.patch('/api/gpu', json={'encoder': 'software'})).json()['device'] == ''
+
+
+async def test_gpu_requires_auth_and_same_origin(client, monkeypatch):
+    assert (await client.patch('/api/gpu', json={'encoder': 'software'},
+                              headers={'origin': 'https://other.example'})).status_code == 403
+    monkeypatch.setattr(config, 'ADMIN_PASSWORD', 'secret')
+    assert (await client.get('/api/gpu')).status_code == 401
+    assert (await client.patch('/api/gpu', json={'encoder': 'software'})).status_code == 401

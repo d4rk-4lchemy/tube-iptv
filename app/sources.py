@@ -4,6 +4,7 @@ import re
 from urllib.parse import urlparse
 from .config import MAX_ITEMS
 from .process import capture
+from .video import RESOLUTIONS
 
 
 # Prefer seekable direct HTTP media over YouTube's HLS variants. Some HLS
@@ -67,9 +68,10 @@ class Sources:
         except Exception as exc:
             self.db.execute("UPDATE sources SET state='error',error=? WHERE id=?", (str(exc)[-1800:], source["id"]))
 
-    async def resolve(self, url):
+    async def resolve(self, url, resolution="1080p"):
+        height = RESOLUTIONS[resolution][1]
         raw = await capture(self.base() + ["--no-playlist", "--skip-download", "-f",
-            FORMAT_SELECTOR, "--dump-single-json", "--", url], 90)
+            FORMAT_SELECTOR.replace("1080", str(height)), "--dump-single-json", "--", url], 90)
         info = json.loads(raw)
         formats = info.get("requested_formats") or [info]
         for fmt in formats:

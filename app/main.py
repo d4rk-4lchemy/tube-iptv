@@ -7,12 +7,13 @@ import sqlite3
 import time
 from urllib.parse import quote, urlparse
 from pathlib import Path
+from typing import Literal
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import ClientDisconnect
 from pydantic import BaseModel, Field
-from . import config
+from . import config, gpu
 from .db import Database
 from .engine import Channel, MAX_SEGMENT
 from .sources import Sources, validate_url
@@ -24,19 +25,40 @@ async def lifespan(app):
     app.state.db = db = Database()
     app.state.versions = versions = Versions(db)
     app.state.sources = sources = Sources(db, versions)
-    app.state.channel = Channel("main", db, sources)
-    from .ingest import UploadServer
-    uploads = UploadServer(app.state.channel)
-    await uploads.start()
-    app.state.channel.clock_task = asyncio.create_task(app.state.channel.clock_loop())
+    app.state.channels = {}
+    app.state.uploads = {}
+    app.state.channel_lock = asyncio.Lock()
+    for row in db.rows("SELECT * FROM channels ORDER BY rowid"):
+        await start_channel(app.state, row['id'])
+    # Compatibility for existing local integrations.
+    app.state.channel = app.state.channels.get('main')
     yield
-    await app.state.channel.close()
-    await uploads.close()
+    for channel in app.state.channels.values():
+        await channel.close()
+    for uploads in app.state.uploads.values():
+        await uploads.close()
     await sources.close()
     if versions.task and not versions.task.done():
         versions.task.cancel()
         await asyncio.gather(versions.task, return_exceptions=True)
     db.conn.close()
+
+
+async def start_channel(state, channel_id):
+    from .ingest import UploadServer
+    channel = Channel(channel_id, state.db, state.sources)
+    uploads = UploadServer(channel)
+    await uploads.start()
+    state.channels[channel_id] = channel
+    state.uploads[channel_id] = uploads
+    channel.clock_task = asyncio.create_task(channel.clock_loop())
+
+
+def find_channel(request, channel_id):
+    channel = request.app.state.channels.get(channel_id)
+    if channel is None:
+        raise HTTPException(404, "Channel not found")
+    return channel
 
 
 app = FastAPI(title="Tube IPTV", lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json", redoc_url=None)
@@ -77,15 +99,17 @@ async def health():
 
 
 @app.get("/api/status")
-async def status(request: Request):
+@app.get("/api/channels/{channel_id}/status")
+async def status(request: Request, channel_id: str = 'main'):
     state = request.app.state
-    channel = state.db.rows("SELECT * FROM channels WHERE id='main'")[0]
-    return {"channel": channel, **state.channel.status(), "sources": state.db.sources(),
-            "media_count": len({m["url"] for m in state.db.media()}),
+    engine = find_channel(request, channel_id)
+    channel = state.db.rows("SELECT * FROM channels WHERE id=?", (channel_id,))[0]
+    return {"channel": channel, **engine.status(), "sources": state.db.sources(channel_id),
+            "media_count": len({m["url"] for m in state.db.media(channel_id)}),
             "yt_dlp": {k: v for k, v in state.versions.current().items() if k != "path"},
             "update": state.versions.job,
             "playlist_url": base_url(request) + "/playlist.m3u8" + token_suffix(),
-            "stream_url": base_url(request) + "/channels/main/index.m3u8" + token_suffix()}
+            "stream_url": base_url(request) + f"/channels/{channel_id}/index.m3u8" + token_suffix()}
 
 
 class SourceInput(BaseModel):
@@ -93,14 +117,16 @@ class SourceInput(BaseModel):
 
 
 @app.post("/api/sources", status_code=202)
-async def add_source(payload: SourceInput, request: Request):
+@app.post("/api/channels/{channel_id}/sources", status_code=202)
+async def add_source(payload: SourceInput, request: Request, channel_id: str = 'main'):
+    find_channel(request, channel_id)
     try:
         url = validate_url(payload.url.strip())
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     source = {"id": secrets.token_hex(12), "url": url}
     try:
-        request.app.state.db.execute("INSERT INTO sources(id,channel_id,url) VALUES(?,'main',?)", (source["id"], url))
+        request.app.state.db.execute("INSERT INTO sources(id,channel_id,url) VALUES(?,?,?)", (source["id"], channel_id, url))
     except sqlite3.IntegrityError:
         raise HTTPException(409, "This URL has already been added")
     request.app.state.sources.refresh(source)
@@ -111,18 +137,21 @@ def find_source(request, source_id):
     rows = request.app.state.db.rows("SELECT * FROM sources WHERE id=?", (source_id,))
     if not rows:
         raise HTTPException(404, "Source not found")
+    find_channel(request, rows[0]['channel_id'])
     return rows[0]
 
 
 @app.delete("/api/sources/{source_id}", status_code=204)
 async def delete_source(source_id: str, request: Request):
-    find_source(request, source_id)
+    source = find_source(request, source_id)
     task = request.app.state.sources.tasks.get(source_id)
     if task:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     request.app.state.db.execute("DELETE FROM sources WHERE id=?", (source_id,))
-    await request.app.state.channel.reconcile_sources()
+    channel = request.app.state.channels.get(source['channel_id'])
+    if channel:
+        await channel.reconcile_sources()
     return Response(status_code=204)
 
 
@@ -132,9 +161,9 @@ class SourcePatch(BaseModel):
 
 @app.patch("/api/sources/{source_id}")
 async def toggle_source(source_id: str, payload: SourcePatch, request: Request):
-    find_source(request, source_id)
+    source = find_source(request, source_id)
     request.app.state.db.execute("UPDATE sources SET enabled=? WHERE id=?", (payload.enabled, source_id))
-    await request.app.state.channel.reconcile_sources()
+    await find_channel(request, source['channel_id']).reconcile_sources()
     return {"ok": True}
 
 
@@ -149,20 +178,99 @@ class ChannelPatch(BaseModel):
 
 
 @app.patch("/api/channel")
-async def rename_channel(payload: ChannelPatch, request: Request):
-    request.app.state.db.execute("UPDATE channels SET name=? WHERE id='main'", (payload.name,))
+@app.patch("/api/channels/{channel_id}")
+async def rename_channel(payload: ChannelPatch, request: Request, channel_id: str = 'main'):
+    find_channel(request, channel_id)
+    request.app.state.db.execute("UPDATE channels SET name=? WHERE id=?", (channel_name(payload), channel_id))
     return {"ok": True}
 
 
+def channel_name(payload):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(422, 'Enter a channel name')
+    return name
+
+
+@app.get('/api/channels')
+async def list_channels(request: Request):
+    return request.app.state.db.rows('SELECT * FROM channels ORDER BY rowid')
+
+
+@app.post('/api/channels', status_code=201)
+async def create_channel(payload: ChannelPatch, request: Request):
+    state = request.app.state
+    row = {'id': secrets.token_hex(12), 'name': channel_name(payload)}
+    async with state.channel_lock:
+        state.db.execute('INSERT INTO channels VALUES(?,?)', (row['id'], row['name']))
+        try:
+            await start_channel(state, row['id'])
+        except Exception:
+            state.db.execute('DELETE FROM channels WHERE id=?', (row['id'],))
+            raise
+    return row
+
+
+@app.delete('/api/channels/{channel_id}', status_code=204)
+async def delete_channel(channel_id: str, request: Request):
+    state = request.app.state
+    async with state.channel_lock:
+        channel = find_channel(request, channel_id)
+        if len(state.channels) == 1:
+            raise HTTPException(409, 'Keep at least one channel')
+        del state.channels[channel_id]
+        tasks = [state.sources.tasks[s['id']] for s in state.db.sources(channel_id)
+                 if s['id'] in state.sources.tasks]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await channel.close()
+        await state.uploads.pop(channel_id).close()
+        with state.db.conn:
+            state.db.conn.execute('DELETE FROM sources WHERE channel_id=?', (channel_id,))
+            state.db.conn.execute('DELETE FROM channels WHERE id=?', (channel_id,))
+            state.db.conn.execute('DELETE FROM settings WHERE key IN (?,?,?,?)',
+                                  (f'timeline:{channel_id}', f'finish_current_on_remove:{channel_id}', f'fps:{channel_id}', f'resolution:{channel_id}'))
+    return Response(status_code=204)
+
+
 class PlaybackSettings(BaseModel):
-    finish_current_on_remove: bool
+    finish_current_on_remove: bool = False
+    fps: Literal[24, 25, 30, 50, 60, "original"] = 60
+    resolution: Literal["480p", "720p", "1080p", "4k"] = "1080p"
 
 
 @app.patch('/api/settings')
-async def update_settings(payload: PlaybackSettings, request: Request):
-    request.app.state.db.set_setting('finish_current_on_remove', payload.finish_current_on_remove)
-    await request.app.state.channel.reconcile_sources()
-    return {'finish_current_on_remove': payload.finish_current_on_remove}
+@app.patch('/api/channels/{channel_id}/settings')
+async def update_settings(payload: PlaybackSettings, request: Request, channel_id: str = 'main'):
+    channel = find_channel(request, channel_id)
+    for key in payload.model_fields_set:
+        request.app.state.db.set_setting(f'{key}:{channel_id}', getattr(payload, key))
+    if 'finish_current_on_remove' in payload.model_fields_set:
+        await channel.reconcile_sources()
+    return {'finish_current_on_remove': channel.finish_current_on_remove, 'fps': channel.fps,
+            'resolution': channel.resolution}
+
+
+class GPUSettings(BaseModel):
+    encoder: Literal['software', 'vaapi', 'qsv', 'nvenc']
+    device: str = Field(default='', max_length=256)
+
+
+@app.get('/api/gpu')
+async def gpu_settings(request: Request):
+    return {**gpu.settings(request.app.state.db), 'devices': await asyncio.to_thread(gpu.inventory)}
+
+
+@app.patch('/api/gpu')
+async def update_gpu(payload: GPUSettings, request: Request):
+    try:
+        await asyncio.to_thread(gpu.validate, payload.encoder, payload.device)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    value = {'encoder': payload.encoder, 'device': payload.device if payload.encoder != 'software' else ''}
+    request.app.state.db.set_setting('gpu_engine', value)
+    return value
 
 
 @app.get("/api/versions/{channel}")
@@ -204,15 +312,16 @@ def check_stream(request):
 @app.get("/playlist.m3u8")
 async def playlist(request: Request):
     check_stream(request)
-    name = request.app.state.db.rows("SELECT name FROM channels WHERE id='main'")[0]["name"]
-    body = f'#EXTM3U\n#EXTINF:-1 tvg-id="main" group-title="Tube IPTV",{name}\n{base_url(request)}/channels/main/index.m3u8{token_suffix()}\n'
+    body = '#EXTM3U\n'
+    for row in request.app.state.db.rows('SELECT * FROM channels ORDER BY rowid'):
+        body += f'#EXTINF:-1 tvg-id="{row["id"]}" group-title="Tube IPTV",{row["name"]}\n{base_url(request)}/channels/{row["id"]}/index.m3u8{token_suffix()}\n'
     return Response(body, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})
 
 
-@app.get("/channels/main/index.m3u8")
-async def stream(request: Request):
+@app.get("/channels/{channel_id}/index.m3u8")
+async def stream(channel_id: str, request: Request):
     check_stream(request)
-    channel = request.app.state.channel
+    channel = find_channel(request, channel_id)
     if not channel.available():
         raise HTTPException(503, "No enabled videos available", headers={"Retry-After": "5"})
     viewer = request.query_params.get("viewer")
@@ -228,6 +337,7 @@ async def stream(request: Request):
         await channel.touch(viewer)
         deadline = asyncio.get_running_loop().time() + 90
         while len(channel.segments) < 2 and channel.state != "ended":
+            find_channel(request, channel_id)
             if not channel.available():
                 raise HTTPException(503, "No enabled videos available", headers={"Retry-After": "5"})
             if await request.is_disconnected():
@@ -247,10 +357,10 @@ async def stream(request: Request):
         channel.waiters -= 1
 
 
-@app.get("/channels/main/segments/{sequence}.ts")
-async def segment(sequence: int, request: Request):
+@app.get("/channels/{channel_id}/segments/{sequence}.ts")
+async def segment(channel_id: str, sequence: int, request: Request):
     check_stream(request)
-    channel = request.app.state.channel
+    channel = find_channel(request, channel_id)
     found = next((s for s in channel.segments if s.sequence == sequence), None)
     if not found:
         raise HTTPException(404, "This segment has expired. Reload the playlist.")
@@ -261,8 +371,8 @@ async def segment(sequence: int, request: Request):
 
 @app.put("/internal/{secret}/{clip}/{filename}")
 async def ingest(secret: str, clip: str, filename: str, request: Request):
-    channel = request.app.state.channel
-    if not hmac.compare_digest(secret, channel.secret) or request.client.host not in ("127.0.0.1", "::1"):
+    channel = next((c for c in request.app.state.channels.values() if hmac.compare_digest(secret, c.secret)), None)
+    if channel is None or request.client.host not in ("127.0.0.1", "::1"):
         raise HTTPException(403)
     body = bytearray()
     started = time.monotonic()

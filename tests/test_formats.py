@@ -2,8 +2,8 @@ from yt_dlp import YoutubeDL
 from app.sources import FORMAT_SELECTOR
 
 
-def choose(formats):
-    with YoutubeDL({'quiet': True, 'skip_download': True, 'format': FORMAT_SELECTOR}) as ydl:
+def choose(formats, height=1080):
+    with YoutubeDL({'quiet': True, 'skip_download': True, 'format': FORMAT_SELECTOR.replace('1080', str(height))}) as ydl:
         info = ydl.process_ie_result({'id': 'fixture', 'title': 'fixture', 'formats': formats}, download=False)
     return [f['format_id'] for f in info.get('requested_formats', [info])]
 
@@ -27,3 +27,8 @@ def test_hls_only_sources_still_supported():
 def test_muxed_and_audio_only_sources_still_supported():
     assert choose([fmt('muxed', 480, audio='aac')]) == ['muxed']
     assert choose([fmt('audio', video='none', audio='aac')]) == ['audio']
+
+
+def test_4k_channel_selects_native_4k_source():
+    assert choose([fmt('1080', 1080), fmt('4k', 2160), fmt('8k', 4320),
+                   fmt('audio', video='none', audio='aac')], 2160) == ['4k', 'audio']

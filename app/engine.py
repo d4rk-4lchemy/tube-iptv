@@ -9,8 +9,9 @@ import re
 import secrets
 import time
 from urllib.parse import quote
-from . import config
+from . import config, gpu
 from .process import stop_process
+from .video import RESOLUTIONS
 from .timeline import Timeline, known_duration
 
 MAX_SEGMENT = 8 * 1024 * 1024
@@ -29,13 +30,16 @@ class Segment:
     source_url: str | None = None
 
 
-def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duration=None):
+def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duration=None, fps=60, resolution="1080p", device=None):
+    width, height, bitrate, maxrate = RESOLUTIONS[resolution]
     encoder = encoder or config.ENCODER
+    device = device if device is not None else config.VAAPI_DEVICE
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "warning", "-threads", "2", "-filter_threads", "2"]
     if encoder == "vaapi":
-        cmd += ["-vaapi_device", config.VAAPI_DEVICE]
+        cmd += ["-vaapi_device", device]
     if encoder == "qsv":
-        cmd += ["-init_hw_device", f"qsv=hw,child_device={config.VAAPI_DEVICE}", "-filter_hw_device", "hw"]
+        cmd += ["-init_hw_device", f"qsv=hw,child_device={device},child_device_type=vaapi", "-filter_hw_device", "hw"]
+    synthetic_fps = 60 if fps == "original" else fps
     video_index, audio_index = None, None
     for index, fmt in enumerate(formats):
         headers = {**info.get("http_headers", {}), **fmt.get("http_headers", {})}
@@ -55,25 +59,39 @@ def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duratio
         if fmt.get("acodec") != "none" and audio_index is None:
             audio_index = index
     if video_index is None:
-        cmd += ["-f", "lavfi", "-i", "color=c=0x161a18:s=1920x1080:r=25"]
+        cmd += ["-f", "lavfi", "-i", f"color=c=0x161a18:s={width}x{height}:r={synthetic_fps}"]
         video_index = len(formats)
     if audio_index is None:
         audio_index = len(formats) + (video_index == len(formats))
         cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
     # Fit the display aspect ratio (including non-square source pixels), then
     # normalize to square pixels before padding the fixed output canvas.
-    filters = ("scale=w='trunc(min(1920,1080*dar)/2)*2':h='trunc(min(1080,1920/dar)/2)*2',"
-               "setsar=1,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,fps=25")
+    filters = (f"scale=w='trunc(min({width},{height}*dar)/2)*2':h='trunc(min({height},{width}/dar)/2)*2',"
+               f"setsar=1,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black")
+    if fps != "original":
+        filters += f",fps={fps}"
     cmd += ["-map", f"{video_index}:v:0", "-map", f"{audio_index}:a:0", "-shortest"]
     if encoder == "vaapi":
         cmd += ["-vf", filters + ",format=nv12,hwupload", "-c:v", "h264_vaapi"]
     elif encoder == "qsv":
         cmd += ["-vf", filters + ",format=nv12,hwupload=extra_hw_frames=64", "-c:v", "h264_qsv"]
+    elif encoder == "nvenc":
+        cmd += ["-vf", filters + ",format=nv12", "-c:v", "h264_nvenc", "-gpu", device]
     else:
         cmd += ["-vf", filters, "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-threads", "2"]
+    if fps == "original":
+        # Preserve source timestamps, including VFR and fractional frame rates.
+        # Use the MPEG-TS clock so encoder rounding does not flatten VFR timing.
+        cmd += ["-fps_mode:v", "vfr", "-enc_time_base:v", "1:90000"]
+    else:
+        cmd += ["-fps_mode:v", "cfr"]
     if duration is not None:
         cmd += ["-t", f"{max(0.04, duration):.6f}"]
-    cmd += ["-b:v", "4500k", "-maxrate", "6000k", "-bufsize", "12000k", "-g", "100", "-keyint_min", "100",
+    # Limit 4K VBV bursts so four-second segments fit the 8 MiB ingest cap.
+    buffer_rate = maxrate if resolution == "4k" else maxrate * 2
+    # With native timing, force keyframes by elapsed time, not frame count.
+    cmd += ["-b:v", f"{bitrate}k", "-maxrate", f"{maxrate}k", "-bufsize", f"{buffer_rate}k",
+            "-g", str(10000 if fps == "original" else fps * 4), "-keyint_min", "1",
             "-sc_threshold", "0", "-force_key_frames", "expr:gte(t,n_forced*4)",
             "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-ar", "48000",
             "-af", "aresample=async=1:first_pts=0", "-max_muxing_queue_size", "1024",
@@ -120,6 +138,7 @@ class Channel:
         self.loading = None
         self.segment_sink = None
         self.state = "idle"
+        self.closed = False
         self.now = None
         self.error = None
         self.events = deque(maxlen=30)
@@ -133,8 +152,17 @@ class Channel:
         self.final_input_segment = None
 
     @property
+    def resolution(self):
+        return self.db.setting(f'resolution:{self.id}', '1080p') if self.db else '1080p'
+
+    @property
+    def fps(self):
+        return self.db.setting(f'fps:{self.id}', 60) if self.db else 60
+
+    @property
     def finish_current_on_remove(self):
-        return bool(self.db and self.db.setting('finish_current_on_remove', False))
+        return bool(self.db and self.db.setting(f'finish_current_on_remove:{self.id}',
+                    self.db.setting('finish_current_on_remove', False) if self.id == 'main' else False))
 
     def retained_current(self):
         return (self.finish_current_on_remove and self.now is not None and (
@@ -151,6 +179,8 @@ class Channel:
         if not self.db:
             return
         async with self.lifecycle:
+            if self.closed:
+                return
             allowed = {item['url'] for item in self.db.media(self.id)}
             if self.prefetch_key and self.prefetch_key[0] not in allowed:
                 await self.cancel_prefetch()
@@ -202,6 +232,8 @@ class Channel:
 
     async def touch(self, viewer):
         async with self.lifecycle:
+            if self.closed:
+                return
             self.viewers[viewer] = time.monotonic()
             if (self.task is None or self.task.done()) and not (self.state == "ended" and not self.db.media(self.id)):
                 self.task = asyncio.create_task(self.run())
@@ -238,13 +270,15 @@ class Channel:
             self.changed.notify_all()
 
     async def close(self):
+        self.closed = True
         if self.clock_task:
             self.clock_task.cancel()
             await asyncio.gather(self.clock_task, return_exceptions=True)
         if self.monitor:
             self.monitor.cancel()
             await asyncio.gather(self.monitor, return_exceptions=True)
-        await self.stop()
+        async with self.lifecycle:
+            await self.stop()
 
     async def cancel_prefetch(self):
         if self.prefetch_task:
@@ -263,9 +297,10 @@ class Channel:
         next_slot = self.timeline.position(slot.ends_at + .001)
         if not next_slot or next_slot.item['url'] not in {m['url'] for m in self.db.media(self.id)}:
             return None
-        self.prefetch_key = next_slot.key
+        resolution = self.resolution
+        self.prefetch_key = (next_slot.key, resolution)
         try:
-            result = await self.sources.resolve(next_slot.item['url'])
+            result = await self.sources.resolve(next_slot.item['url'], resolution=resolution)
             self.event('Next source resolved ahead of programme boundary')
             return result
         except asyncio.CancelledError:
@@ -320,11 +355,12 @@ class Channel:
                 initial = self.clip_duration
                 try:
                     resolving = time.monotonic()
+                    resolution = self.resolution
                     resolved = None
-                    if self.prefetch_task and self.prefetch_key == slot.key:
+                    if self.prefetch_task and self.prefetch_key == (slot.key, resolution):
                         resolved = await self.prefetch_task
                     await self.cancel_prefetch()
-                    info, formats = resolved or await self.sources.resolve(item["url"])
+                    info, formats = resolved or await self.sources.resolve(item["url"], resolution=resolution)
                     elapsed = round(time.monotonic() - resolving, 3)
                     self.metrics['last_resolve_seconds'] = elapsed
                     if self.metrics['resolve_seconds'] is None:
@@ -334,7 +370,7 @@ class Channel:
                         f"{f.get('format_id', '?')} ({f.get('protocol', '?')}, {f.get('vcodec', '?')})"
                         for f in formats))
                     if known_duration(info.get("duration")) and not info.get("is_live"):
-                        self.db.execute("UPDATE media SET duration=? WHERE url=?", (info["duration"], item["url"]))
+                        self.db.update_duration(self.id, item['url'], info['duration'])
                     current = self.scheduled()
                     # Extraction may cross a programme boundary. Never play a stale slot.
                     if not current or current.key != slot.key:
@@ -348,7 +384,7 @@ class Channel:
                     self.clip_time = max(time.time(), self.media_buffer.tail_deadline or 0)
                     self.prefetch_task = asyncio.create_task(self.prefetch_next(slot))
                     destination = f"{self.upload_base}/{self.clip}"
-                    command = ffmpeg_command(formats, info, destination, offset=offset, duration=remaining)
+                    command = ffmpeg_command(formats, info, destination, offset=offset, duration=remaining, fps=self.fps, resolution=resolution, **gpu.settings(self.db))
                     self.event(f"On air: {item['title']} · joining at {int(offset)}s")
                     self.ffmpeg_started = time.monotonic()
                     self.startup_started = started
@@ -386,8 +422,7 @@ class Channel:
                     if slot.item['estimated'] and not info.get('is_live'):
                         # Some generic extractors do not report duration. Learn it at EOF,
                         # without probing/downloading anything while there are no viewers.
-                        self.db.execute("UPDATE media SET duration=? WHERE url=?",
-                                        (offset + self.clip_duration, item['url']))
+                        self.db.update_duration(self.id, item['url'], offset + self.clip_duration)
                     # Do not wait for the scheduled boundary or drain the RAM
                     # reserve.  Its final segments remain in FIFO order while
                     # the next encoder is already preparing a replacement.
@@ -624,8 +659,8 @@ class Channel:
                 "offset": slot.offset(time.time())} if slot else None)
         return {"state": self.state, "viewers": len(self.viewers), "now": now,
                 "buffer_bytes": self.bytes, "segments": len(self.segments), "error": self.error,
-                "events": list(self.events), "encoder": config.ENCODER,
-                "finish_current_on_remove": self.finish_current_on_remove,
+                "events": list(self.events), "encoder": gpu.settings(self.db)["encoder"],
+                "finish_current_on_remove": self.finish_current_on_remove, "fps": self.fps, "resolution": self.resolution,
                 "stream_revision": self.stream_revision, "stream_available": self.available() if self.db else False,
                 "diagnostics": {**self.metrics,
                     "reserve_segments": self.media_buffer.count if self.media_buffer else 0,

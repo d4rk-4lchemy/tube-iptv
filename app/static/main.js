@@ -1,6 +1,8 @@
 import { api, $, escape, toast, action } from './api.js';
-import { startPreview, syncPreview } from './player.js';
+import { startPreview, stopPreview, syncPreview } from './player.js';
 let state, sourceSignature = '', deleteId = null;
+let selectedChannel = null, channels = [], refreshRequest = 0, editingChannel = null;
+const channelPath = path => `channels/${selectedChannel}${path ? '/' + path : ''}`;
 const labels = { idle: 'IDLE', buffering: 'BUFFERING', live: 'LIVE', error: 'RETRYING', empty: 'NO SOURCES', ended: 'FINISHED' };
 function formatTime(seconds) {
   const value = Math.max(0, Math.floor(seconds));
@@ -10,8 +12,16 @@ function render(data) {
   state = data;
   syncPreview(data);
   if (!$('finish-current').disabled) $('finish-current').checked = data.finish_current_on_remove;
+  if (!$('channel-resolution').disabled) $('channel-resolution').value = data.resolution;
+  if (!$('channel-fps').disabled) $('channel-fps').value = String(data.fps);
   $('connection').textContent = 'Server connected';
   $('channel-name').textContent = data.channel.name;
+  const number = String(channels.findIndex(c => c.id === data.channel.id) + 1).padStart(2, '0');
+  $('channel-number').textContent = number;
+  $('monitor-channel').textContent = `CH ${number} · ${data.resolution === '4k' ? '4K' : data.resolution}`;
+  $('screen-number').textContent = number;
+  $('channel-count').textContent = String(channels.length).padStart(2, '0');
+  $('remove-channel').disabled = channels.length < 2;
   $('state-label').textContent = labels[data.state] || data.state;
   $('state-dot').classList.toggle('live', data.state === 'live');
   $('now-playing').textContent = data.now?.title || 'No programme scheduled';
@@ -44,7 +54,52 @@ function render(data) {
   $('error-details').hidden = !data.error;
   $('engine-error').textContent = data.error || '';
 }
-async function refresh() { render(await api('status')); }
+async function refresh() {
+  const request = ++refreshRequest;
+  const list = await api('channels');
+  if (request !== refreshRequest) return;
+  channels = list;
+  if (!channels.some(c => c.id === selectedChannel)) {
+    stopPreview();
+    selectedChannel = channels[0].id;
+  }
+  const data = await api(channelPath('status'));
+  if (request !== refreshRequest) return;
+  const options = channels.map(c => `<option value="${escape(c.id)}">${escape(c.name)}</option>`).join('');
+  if ($('channel-select').innerHTML !== options) $('channel-select').innerHTML = options;
+  $('channel-select').value = selectedChannel;
+  render(data);
+}
+$('channel-select').onchange = () => {
+  selectedChannel = $('channel-select').value;
+  state = null;
+  stopPreview();
+  $('source-url').value = '';
+  action(refresh);
+};
+$('new-channel').onclick = () => {
+  editingChannel = null;
+  $('name-input').value = '';
+  $('rename-dialog').showModal();
+};
+$('remove-channel').onclick = () => {
+  if (!state) return;
+  $('remove-channel-title').textContent = state.channel.name;
+  $('remove-channel-dialog').dataset.channel = state.channel.id;
+  $('remove-channel-dialog').showModal();
+};
+$('cancel-remove-channel').onclick = () => $('remove-channel-dialog').close();
+$('remove-channel-form').onsubmit = event => {
+  event.preventDefault();
+  action(async () => {
+    const id = $('remove-channel-dialog').dataset.channel;
+    await api(`channels/${id}`, { method: 'DELETE' });
+    $('remove-channel-dialog').close();
+    if (selectedChannel === id) { stopPreview(); selectedChannel = null; state = null; }
+    toast('Channel and its sources removed');
+    await refresh();
+  });
+};
 async function poll() {
   try { await refresh(); } catch { $('connection').textContent = 'Server disconnected'; }
   setTimeout(poll, 2000);
@@ -53,13 +108,14 @@ $('add-source').addEventListener('submit', event => {
   event.preventDefault();
   action(async () => {
     const button = event.target.querySelector('button'); button.disabled = true;
-    try { await api('sources', { method: 'POST', body: JSON.stringify({ url: $('source-url').value.trim() }) }); $('source-url').value = ''; toast('Source added. Reading the video list.'); await refresh(); }
+    try { await api(channelPath('sources'), { method: 'POST', body: JSON.stringify({ url: $('source-url').value.trim() }) }); $('source-url').value = ''; toast('Source added. Reading the video list.'); await refresh(); }
     finally { button.disabled = false; }
   });
 });
 $('source-list').addEventListener('click', event => {
   const button = event.target.closest('button[data-action]'); if (!button) return;
-  const source = state.sources.find(s => s.id === button.closest('[data-id]').dataset.id);
+  const source = state?.sources.find(s => s.id === button.closest('[data-id]').dataset.id);
+  if (!source) return;
   action(async () => {
     if (button.dataset.action === 'delete') { deleteId = source.id; $('delete-title').textContent = source.title || source.url; $('delete-behaviour').textContent = state.finish_current_on_remove ? 'Removed videos will leave the queue. Only the currently playing video may finish.' : 'Removed videos will stop immediately and leave the queue.'; $('delete-dialog').showModal(); return; }
     if (button.dataset.action === 'toggle') await api(`sources/${source.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: !source.enabled }) });
@@ -69,9 +125,15 @@ $('source-list').addEventListener('click', event => {
 });
 $('delete-form').addEventListener('submit', event => { event.preventDefault(); action(async () => { await api(`sources/${deleteId}`, { method: 'DELETE' }); $('delete-dialog').close(); toast('Source removed'); await refresh(); }); });
 $('cancel-delete').onclick = () => $('delete-dialog').close();
-$('rename').onclick = () => { if (!state) return; $('name-input').value = state.channel.name; $('rename-dialog').showModal(); };
+$('rename').onclick = () => { if (!state) return; editingChannel = state.channel.id; $('name-input').value = state.channel.name; $('rename-dialog').showModal(); };
 $('cancel-rename').onclick = () => $('rename-dialog').close();
-$('rename-form').addEventListener('submit', event => { event.preventDefault(); action(async () => { await api('channel', { method: 'PATCH', body: JSON.stringify({ name: $('name-input').value.trim() }) }); $('rename-dialog').close(); await refresh(); }); });
+$('rename-form').addEventListener('submit', event => { event.preventDefault(); action(async () => {
+  const creating = !editingChannel;
+  const result = await api(creating ? 'channels' : `channels/${editingChannel}`, {
+    method: creating ? 'POST' : 'PATCH', body: JSON.stringify({ name: $('name-input').value.trim() }) });
+  if (creating) { stopPreview(); selectedChannel = result.id; state = null; }
+  $('rename-dialog').close(); await refresh();
+}); });
 async function copyPlaylist() {
   if (!state) return;
   try { await navigator.clipboard.writeText(state.playlist_url); toast('Playlist URL copied'); }
@@ -103,9 +165,79 @@ $('finish-current').addEventListener('change', () => {
   input.disabled = true;
   action(async () => {
     try {
-      await api('settings', { method: 'PATCH', body: JSON.stringify({ finish_current_on_remove: selected }) });
+      await api(channelPath('settings'), { method: 'PATCH', body: JSON.stringify({ finish_current_on_remove: selected }) });
       toast(selected ? 'The current video may finish after source removal.' : 'Removed videos will stop immediately.');
     } catch (error) { input.checked = !selected; throw error; }
     finally { input.disabled = false; await refresh(); }
   });
 });
+
+$('channel-fps').addEventListener('change', () => {
+  const input = $('channel-fps');
+  const path = channelPath('settings');
+  const fps = input.value === 'original' ? 'original' : Number(input.value);
+  input.disabled = true;
+  action(async () => {
+    try {
+      await api(path, { method: 'PATCH', body: JSON.stringify({ fps }) });
+      toast('Frame rate saved. Applies from the next video or stream start.');
+    } finally { input.disabled = false; await refresh(); }
+  });
+});
+
+$('channel-resolution').addEventListener('change', () => {
+  const input = $('channel-resolution');
+  const path = channelPath('settings');
+  const resolution = input.value;
+  input.disabled = true;
+  action(async () => {
+    try {
+      await api(path, { method: 'PATCH', body: JSON.stringify({ resolution }) });
+      toast('Resolution saved. Applies from the next video or stream start.');
+    } finally { input.disabled = false; await refresh(); }
+  });
+});
+
+let gpuDevices = [], gpuDevice = '';
+function renderGPUDevices() {
+  const encoder = $('gpu-driver').value;
+  const devices = gpuDevices.filter(d => d.encoders.includes(encoder));
+  $('gpu-device').innerHTML = devices.length ? devices.map(d => `<option value="${escape(d.id)}" ${d.accessible ? '' : 'disabled'}>${escape(d.label)}${d.accessible ? '' : ' (no access)'}</option>`).join('') : '<option value="">No compatible GPU available</option>';
+  if (devices.some(d => d.id === gpuDevice && d.accessible)) $('gpu-device').value = gpuDevice;
+  else $('gpu-device').value = devices.find(d => d.accessible)?.id || '';
+  $('gpu-device').disabled = encoder === 'software';
+  $('save-gpu').disabled = encoder !== 'software' && !$('gpu-device').value;
+}
+async function loadGPU() {
+  const data = await api('gpu');
+  gpuDevices = data.devices;
+  gpuDevice = data.device;
+  $('gpu-driver').value = data.encoder;
+  renderGPUDevices();
+  $('gpu-status').textContent = `Saved: ${data.encoder.toUpperCase()}${data.encoder === 'software' ? '' : ' · ' + data.device}. Applies to all channels from the next video or stream start.`;
+}
+$('gpu-driver').onchange = renderGPUDevices;
+$('gpu-device').onchange = () => { gpuDevice = $('gpu-device').value; };
+$('refresh-gpu').onclick = () => action(loadGPU);
+$('gpu-settings').onsubmit = event => {
+  event.preventDefault();
+  const encoder = $('gpu-driver').value, device = $('gpu-device').value;
+  action(async () => {
+    const controls = [...$('gpu-settings').elements];
+    controls.forEach(control => { control.disabled = true; });
+    $('gpu-status').textContent = 'Testing encoder and saving…';
+    try {
+      await api('gpu', { method: 'PATCH', body: JSON.stringify({ encoder, device }) });
+      await loadGPU();
+      await refresh();
+      toast('Encoding settings saved for all channels.');
+    } catch (error) {
+      $('gpu-status').textContent = error.message;
+      throw error;
+    } finally {
+      controls.forEach(control => { control.disabled = false; });
+      renderGPUDevices();
+    }
+  });
+};
+action(loadGPU);

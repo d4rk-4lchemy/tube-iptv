@@ -15,7 +15,7 @@ class Database:
         PRAGMA journal_mode=WAL;
         PRAGMA foreign_keys=ON;
         CREATE TABLE IF NOT EXISTS channels(id TEXT PRIMARY KEY, name TEXT NOT NULL);
-        INSERT OR IGNORE INTO channels VALUES('main', 'Tube / 01');
+        INSERT INTO channels SELECT 'main', 'Tube / 01' WHERE NOT EXISTS (SELECT 1 FROM channels);
         CREATE TABLE IF NOT EXISTS sources(
             id TEXT PRIMARY KEY, channel_id TEXT REFERENCES channels(id), url TEXT NOT NULL,
             title TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
@@ -62,6 +62,10 @@ class Database:
     def setting(self, key, default=None):
         rows = self.rows("SELECT value FROM settings WHERE key=?", (key,))
         return json.loads(rows[0]["value"]) if rows else default
+
+    def update_duration(self, channel, url, duration):
+        self.execute('''UPDATE media SET duration=? WHERE url=? AND source_id IN
+            (SELECT id FROM sources WHERE channel_id=?)''', (duration, url, channel))
 
     def set_setting(self, key, value):
         self.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (key, json.dumps(value)))

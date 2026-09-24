@@ -1,0 +1,27 @@
+import json
+import shutil
+import subprocess
+
+import pytest
+
+from app.engine import ffmpeg_command
+
+
+@pytest.mark.skipif(not shutil.which('ffmpeg') or not shutil.which('ffprobe'), reason='FFmpeg required')
+@pytest.mark.parametrize('resolution,width,height', [
+    ('480p', 854, 480), ('720p', 1280, 720), ('1080p', 1920, 1080), ('4k', 3840, 2160),
+])
+def test_encoded_canvas(resolution, width, height):
+    command = ffmpeg_command([], {}, 'http://localhost/unused', encoder='software',
+                             duration=0.2, fps=24, resolution=resolution)
+    index = next(i for i, value in enumerate(command) if value.startswith('color='))
+    command[index] = 'testsrc2=s=320x240:r=24,setsar=4/3'
+    command[command.index('hls') - 1:] = ['-f', 'mpegts', 'pipe:1']
+    result = subprocess.run(command, capture_output=True, check=True, timeout=60)
+    probe = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                            '-show_entries', 'stream=width,height,sample_aspect_ratio',
+                            '-of', 'json', 'pipe:0'], input=result.stdout,
+                           capture_output=True, check=True, timeout=30)
+    video = json.loads(probe.stdout)['streams'][0]
+    assert (video['width'], video['height']) == (width, height)
+    assert video['sample_aspect_ratio'] == '1:1'

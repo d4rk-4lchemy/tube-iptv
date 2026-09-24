@@ -4,16 +4,16 @@
   <img src="app/static/logo.svg" alt="Tube IPTV logo" width="144">
 </p>
 
-<p align="center"><strong>One shared IPTV channel built from yt-dlp sources.</strong><br>
-Add videos or playlists, and every viewer joins the same live programme position.</p>
+<p align="center"><strong>Your IPTV channels, built from yt-dlp sources.</strong><br>
+Add videos or playlists, and viewers of each channel join the same live programme position.</p>
 
-Tube IPTV turns links supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp) into one continuously running HLS channel. It includes an English web console, browser preview, IPTV playlist export, and selectable stable/nightly yt-dlp releases without rebuilding the image.
+Tube IPTV turns links supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp) into independent HLS channels with continuous schedules. It includes an English web console, browser preview, IPTV playlist export, and selectable stable/nightly yt-dlp releases without rebuilding the image.
 
 ## Features
 
-- One shared, wall-clock programme for every viewer.
+- Independent channels, each with its own sources and a wall-clock programme shared by its viewers.
 - Video and playlist sources from yt-dlp-supported services.
-- HLS output at 1920×1080 / 25 fps with H.264 video and AAC audio.
+- HLS output at selectable 480p, 720p, 1080p (default), or 4K with H.264 video, AAC audio, and per-channel frame rates (60 FPS by default).
 - RAM-only media buffers: videos and HLS segments are never written to disk.
 - Web preview, source management, playlist export, and broadcast diagnostics.
 - Stable and nightly yt-dlp releases with checksum verification and atomic activation.
@@ -30,10 +30,12 @@ docker compose up -d --build
 
 Open the web console at <http://localhost:8000> and add a video, playlist, or channel URL.
 
+Use the channel selector to switch channels and **New channel** to create one. Names, sources, previews, diagnostics, resolutions, frame rates, and source-removal settings apply to the selected channel. The yt-dlp installation and updates are shared by all channels. The IPTV playlist contains every channel; each starts media production only when watched. Removing a channel stops its stream and deletes its sources and schedule; at least one channel must remain. Existing installations keep their `main` channel and schedule.
+
 | Endpoint | Purpose |
 | --- | --- |
 | <http://localhost:8000> | Web console and browser preview |
-| <http://localhost:8000/playlist.m3u8> | IPTV playlist |
+| <http://localhost:8000/playlist.m3u8> | IPTV playlist containing all channels |
 | <http://localhost:8000/channels/main/index.m3u8> | Main HLS stream |
 | <http://localhost:8000/api/docs> | OpenAPI documentation |
 
@@ -63,12 +65,14 @@ Application state, sources, and installed yt-dlp releases are stored in the `tub
 
 ## How the channel works
 
+The following flow runs independently for each channel. Stream URLs use `/channels/{id}/index.m3u8`; IDs stay stable when a channel is renamed. Buffer limits are per channel, so RAM and encoding costs grow with the number of channels being watched simultaneously.
+
 ```text
 links → yt-dlp (playlist metadata) → SQLite → shuffled programme pool
                                                    ↓
                           yt-dlp (video/audio URLs, without downloading)
                                                    ↓
-                      FFmpeg (network → H.264 + AAC, 1920×1080 / 25 fps)
+                      FFmpeg (network → H.264 + AAC, channel resolution and FPS)
                                                    ↓
                          local HTTP PUT → bounded RAM buffer
                                                    ↓
@@ -78,11 +82,11 @@ links → yt-dlp (playlist metadata) → SQLite → shuffled programme pool
 - yt-dlp uses `--skip-download` and `--no-cache-dir`. FFmpeg reads the URLs returned by yt-dlp directly, including separate YouTube audio and video tracks.
 - No video or HLS segment is stored as a file. FFmpeg uploads segments to a loopback endpoint protected by a random secret, and the application keeps the bytes in RAM.
 - The published buffer is limited to 12 segments / 64 MiB, with an 8 MiB limit per segment. A separate queue for segments waiting for the manifest is bounded too. These limits cover media buffers, not the complete Python, extractor, or FFmpeg RSS.
-- Output is always 1920×1080 / 25 fps. yt-dlp prefers a direct HTTPS stream up to 1080p for seeking and falls back to other formats, including HLS. Smaller sources are scaled with aspect ratio preserved and black padding where needed.
+- Output resolution is set per channel: 480p (854×480), 720p (1280×720), 1080p (1920×1080, default), or 4K (3840×2160). Resolution changes apply from the next video or stream start, including the loading slate and audio-only background. Each channel can select 24, 25, 30, 50, or 60 FPS (default), or **Leave original** to preserve source timestamps and native frame rate, including VFR. Fixed rates duplicate or drop frames without motion interpolation. Settings are saved per channel and apply from the next video or stream start. The loading slate and audio-only background use the selected fixed rate, or 60 FPS in original mode. Keyframes are forced every four seconds; with native timing, the next available frame starts the segment. yt-dlp prefers a direct HTTPS stream up to the selected output resolution for seeking and falls back to other formats, including HLS. Smaller sources are scaled with aspect ratio preserved and black padding where needed.
 - VOD is read with limited look-ahead: up to 3 ready segments, usually 12 seconds and at most 24 MiB, are held before publication. A full queue pauses the upload, so the application does not download the whole video in advance. Live sources are read in real time.
 - Up to 20 seconds before a video ends, the next source may be prepared. That work is cancelled when viewers disappear, and removed sources are not used during the transition.
 - Segments are usually 4 seconds long. HLS playlists expose the latest 6 segments, while older segments remain briefly available for clients. Programme boundaries use `EXT-X-DISCONTINUITY`, and the global media sequence never moves backwards.
-- The channel clock starts after the first source is read and continues without viewers. The first viewer starts extraction and FFmpeg at the current programme position; later viewers join the same producer. A `LOADING…` slate with silent H.264/AAC 1080p output is sent while the first video is prepared.
+- The channel clock starts after the first source is read and continues without viewers. The first viewer starts extraction and FFmpeg at the current programme position; later viewers join the same producer. A `LOADING…` slate with silent H.264/AAC output at the selected resolution is sent while the first video is prepared.
 - HLS activity is used to detect when viewing ends. By default, the channel stops its processes and releases RAM 25 seconds after the last manifest or segment request (`IDLE_SECONDS`). The status API does not keep the broadcast alive.
 - The viewer count represents active HLS sessions, not a verified number of people. Some clients can temporarily inflate it by abandoning redirected URLs.
 - The clock origin, programme catalogue, and shuffle seed are stored as SQLite metadata. After a restart, the current position is calculated from wall-clock time, even if multiple cycles passed without viewers.
@@ -112,6 +116,10 @@ ENCODER=vaapi docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
 
 For Intel Quick Sync, use `ENCODER=qsv`. `VAAPI_DEVICE` selects another render device. `compose.gpu.yaml` passes `/dev/dri` and the device groups without requiring a privileged container. The image includes Mesa VAAPI and Intel Media drivers.
 
+The right-hand **GPU engine** panel selects a shared encoder and GPU for all channels. It lists accessible render devices from `/dev/dri` for VAAPI (Intel/AMD) and Intel QSV, plus NVIDIA devices detected with `nvidia-smi` for NVENC. Save runs a short FFmpeg encoding test; a failed test leaves the previous configuration intact. Saved settings persist in SQLite, override the environment defaults, and apply from the next video or stream start. CPU encoding remains available when no GPU is exposed. Use **Refresh devices** after changing device access.
+
+NVIDIA NVENC requires a compatible host driver, FFmpeg with `h264_nvenc`, and GPU access inside the container (NVIDIA Container Toolkit with `video,utility,compute` driver capabilities). Passing `/dev/dri` alone does not enable NVENC. AMD uses Mesa VAAPI in the supplied Linux image. See the [FFmpeg hardware device documentation](https://ffmpeg.org/ffmpeg.html) and [NVIDIA FFmpeg guide](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/ffmpeg-with-nvidia-gpu/index.html).
+
 Hardware acceleration covers encoding. Decoding and scaling remain software-based so mixed source formats work. GPU modes must be verified on the target host. VAAPI was validated through the full HLS/Chromium path; QSV returned an MFX session initialization error in the preparation environment.
 
 ## Development
@@ -138,7 +146,7 @@ Keep the Uvicorn port and `PORT` identical: FFmpeg uploads segments to that port
 | `app/main.py` | API, lifecycle, authorization, and IPTV endpoints |
 | `app/static/` | Console, player/API modules, and responsive styles |
 
-The data model separates channels, sources, and media items, but the current API and UI expose only the `main` channel. Multiple channels, custom ordering, and XMLTV require additional implementation. Any extension should keep yt-dlp as the only source interpreter; local media scanners and Plex/Jellyfin libraries are not supported.
+The API and UI expose independent channels with separate sources and schedules. Custom ordering and XMLTV require additional implementation. Any extension should keep yt-dlp as the only source interpreter; local media scanners and Plex/Jellyfin libraries are not supported.
 
 ## Testing
 
@@ -147,6 +155,8 @@ uv run pytest -q
 npx playwright install chromium
 mkdir -p artifacts
 node scripts/ui-check.mjs
+# On an empty disposable container; uses a real YouTube 4K source:
+TUBE_URL=http://127.0.0.1:8002 node scripts/resolution-check.mjs
 ```
 
 Run integration scripts only against an isolated, empty test instance. They modify sources and settings, and some stop or suspend FFmpeg. Example:
@@ -161,11 +171,11 @@ docker rm -fv tube-iptv-test
 
 The full-path smoke test generates short local audio/video fixtures, exercises real yt-dlp and FFmpeg, checks codecs with ffprobe, verifies HLS transitions and Chromium playback, and checks that the buffer stops and is released. `TUBE_URL` and `FIXTURE_HOST` can override its addresses.
 
-Additional checks include `scripts/timeline-check.py`, `scripts/removal-check.py`, `scripts/loading-check.py`, and `scripts/buffer-check.py`. Read the script headers before running them; several expect a separate test container and local fixture ports.
+Additional checks include `scripts/channels-check.py`, `scripts/timeline-check.py`, `scripts/removal-check.py`, `scripts/loading-check.py`, and `scripts/buffer-check.py`. The channels check verifies simultaneous independent streams, shared yt-dlp, channel removal during playback, and idle shutdown. Read the script headers before running them; several expect a separate test container and local fixture ports.
 
 ## Diagnostics and upload ordering
 
-`docker compose logs -f` reports extraction time, the first complete segment, reserve readiness, interrupted uploads, and FFmpeg warnings. The same recent measurements are available under `diagnostics` in `GET /api/status`. URLs in FFmpeg warnings are redacted so signed CDN URLs are not logged.
+`docker compose logs -f` reports extraction time, the first complete segment, reserve readiness, interrupted uploads, and FFmpeg warnings with the channel ID. The same recent measurements are available under `diagnostics` in `GET /api/channels/{id}/status`; `/api/status` remains an alias for `main`. URLs in FFmpeg warnings are redacted so signed CDN URLs are not logged.
 
 FFmpeg manifests and segments can arrive over different connections and in any order. The server publishes a segment only after receiving both its metadata and complete body, preserving input order. A lost upload creates a discontinuity while retaining its position on the programme timeline.
 

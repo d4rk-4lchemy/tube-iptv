@@ -159,7 +159,7 @@ async def test_next_source_prefetch_is_cancelled_and_reaped(tmp_path):
     started, stopped = asyncio.Event(), asyncio.Event()
     calls = []
     class Source:
-        async def resolve(self, url):
+        async def resolve(self, url, resolution="1080p"):
             calls.append(url)
             started.set()
             try:
@@ -205,7 +205,7 @@ async def test_recovery_and_handoff_keep_media_cursor_without_draining(tmp_path,
     db.execute("INSERT INTO sources(id,channel_id,url) VALUES('s','main','https://example.com/list')")
     db.replace_media('s', 'Test', [{'url': 'https://example.com/a', 'title': 'A', 'duration': duration}])
     class Sources:
-        async def resolve(self, url):
+        async def resolve(self, url, resolution="1080p"):
             return {'duration': duration}, [{'url': url, 'vcodec': 'h264', 'acodec': 'aac'}]
     channel = Channel('main', db, Sources())
     monkeypatch.setattr(LoadingSlate, 'start', lambda self: None)

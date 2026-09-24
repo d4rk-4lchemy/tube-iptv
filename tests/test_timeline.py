@@ -124,7 +124,7 @@ async def test_idle_clock_never_resolves_or_launches_media(tmp_path):
     db.execute("INSERT INTO sources(id,channel_id,url) VALUES('s','main','https://example.com')")
     db.replace_media('s', 'Test', items(600))
     class NoMedia:
-        async def resolve(self, url):
+        async def resolve(self, url, resolution="1080p"):
             raise AssertionError('Idle channels must not resolve media')
     channel = Channel('main', db, NoMedia())
     channel.timeline.clock = lambda: 1000
