@@ -9,9 +9,13 @@ from PIL import ImageFont
 
 FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
 BOLD_FONT = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
-SUFFIX = re.compile(
-    r'\s*[\[(]\s*(?:official\s+(?:music\s+)?video|official\s+audio|lyrics|hd|4k)\s*[\])]\s*$',
-    re.IGNORECASE)
+VIDEO_LABEL = re.compile(
+    r'(?:official\s+)?(?:music\s+video|video|audio|lyrics?|lyric\s+video|visuali[sz]er)'
+    r'|hd|hq|4k|1080p', re.IGNORECASE)
+BRACKETS = re.compile(r'\(([^()]*)\)|\[([^\[\]]*)\]')
+FEATURE = r'(?:ft\.?|feat\.?|featuring)\s+'
+FEATURE_CREDIT = re.compile(FEATURE + r'(.+)', re.IGNORECASE)
+TRAILING_FEATURE = re.compile(r'\s+' + FEATURE + r'([^()[\]]+?)(?=\s*[\[(]|$)', re.IGNORECASE)
 SEPARATOR = re.compile(r'\s+[-–—]\s+')
 
 
@@ -32,9 +36,38 @@ def clean(value):
 
 def clean_title(value):
     value = clean(value)
-    while SUFFIX.search(value):
-        value = SUFFIX.sub('', value).strip()
-    return value
+    # Only discard known presentation labels, never arbitrary parentheticals.
+    return clean(BRACKETS.sub(
+        lambda m: ' ' if VIDEO_LABEL.fullmatch((m[1] or m[2]).strip()) else m[0], value))
+
+
+def split_features(artist, track):
+    """Move explicit guest credits to the artist, keeping version annotations."""
+    credits = []
+    brackets = list(BRACKETS.finditer(track))
+    for match in brackets:
+        credit = FEATURE_CREDIT.fullmatch((match[1] or match[2]).strip())
+        if credit:
+            credits.append((match.start(), match.end(), credit[1].strip()))
+    for match in TRAILING_FEATURE.finditer(track):
+        if (not SEPARATOR.search(match[1])
+                and not any(b.start() <= match.start() < b.end() for b in brackets)):
+            credits.append((match.start(), match.end(), match[1].strip()))
+    credits.sort()
+    title = track
+    for start, end, guest in reversed(credits):
+        title = title[:start] + ' ' + title[end:]
+    title = clean(title)
+    if not title or not credits:
+        return artist, track
+    # Repeated credits on both sides of the separator should appear only once.
+    existing = re.search(r'(?<!\w)' + FEATURE + r'(.+)', artist, re.IGNORECASE)
+    seen = {existing[1].strip().casefold()} if existing else set()
+    for _, _, guest in credits:
+        if guest.casefold() not in seen:
+            artist += ' ft. ' + guest
+            seen.add(guest.casefold())
+    return artist, title
 
 
 def caption(info, item):
@@ -53,7 +86,7 @@ def caption(info, item):
     if len(parts) == 2 and all(parts):
         candidate_artist, candidate_track = parts
         if not artist and not track:
-            artist, track = candidate_artist, candidate_track
+            artist, track = split_features(candidate_artist, candidate_track)
         elif artist and not track and artist.casefold() == candidate_artist.casefold():
             track = candidate_track
         elif track and not artist and track.casefold() == candidate_track.casefold():
@@ -145,6 +178,6 @@ def filters(value, width, height, offset=0.0, end=None):
     for (text, path, size), line_height in zip(lines, heights):
         output.append(f"drawtext=fontfile={path}:text={escape_text(text)}:expansion=none:"
                       f"fontcolor=white:fontsize={size}:borderw={border}:bordercolor=black:"
-                      f"x={round(width * .55) + border}:y={y}:alpha='{expression}'")
+                      f"x={round(width * .05) + border}:y={y}:alpha='{expression}'")
         y += line_height + gap
     return ','.join(output)

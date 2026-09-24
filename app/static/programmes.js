@@ -22,7 +22,7 @@ document.body.insertAdjacentHTML('beforeend', `
   <form id="programme-form"><h2 id="programme-editor-title">New programme</h2>
     <label for="programme-name">Programme name</label><input id="programme-name" required maxlength="120">
     <label class="programme-music" for="programme-music"><span>Music</span><input id="programme-music" type="checkbox" role="switch"></label>
-    <p class="field-hint">Show artist and song captions on each clip. Changes apply from the next programme emission.</p>
+    <p class="field-hint">Show artist and song captions on each clip. Changes apply from the next source in the current emission.</p>
     <label for="programme-duration">Duration in local minutes</label><input id="programme-duration" type="number" min="1" max="1440" step="1" required value="60">
     <p class="field-hint">Films may finish up to 5 minutes late. If none fits, the last film is cut at the planned end. Clock changes preserve local start and end times.</p>
     <h3>Weekly times</h3><div id="programme-rules"></div><button type="button" class="button small" id="add-programme-rule">Add time +</button>

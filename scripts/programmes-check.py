@@ -113,7 +113,7 @@ async def main():
                         white = ImageChops.darker(ImageChops.darker(red, green), blue).point(lambda v: 255 if v > 190 else 0)
                         bounds = white.getbbox()
                         if bounds and image.getpixel((0, 0))[0] > 150:
-                            assert bounds[0] >= 854 * .55 - 1 and bounds[2] <= 854 * .95 + 1, bounds
+                            assert bounds[0] >= 854 * .05 - 1 and bounds[2] <= 854 * .45 + 1, bounds
                             assert bounds[1] > 480 * .65 and bounds[3] < 480 * .9 + 1, bounds
                             Path('artifacts').mkdir(exist_ok=True)
                             image.save('artifacts/music-hls-caption.png')
@@ -130,7 +130,7 @@ async def main():
                     assert next_start >= start + duration - .002, (left, right, start, duration, next_start)
             assert len(seen) >= 8
             assert caption_seen, 'Music caption was not found in decoded HLS frames'
-            print('PASS: Music artist/title caption decoded from HLS in the lower-right safe area', flush=True)
+            print('PASS: Music artist/title caption decoded from HLS in the lower-left safe area', flush=True)
             xml = (await get('/epg.xml')).text
             assert '<title>Integration programme</title>' in xml and '<title>No planned programme</title>' in xml
             assert '<title>clip</title>' not in xml

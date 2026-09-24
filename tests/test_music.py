@@ -18,7 +18,7 @@ from test_programmes import programme, insert, source, stamp
     ({'artists': [None, '', 'A', 'A'], 'artist': 'Other', 'track': 'Song'}, '', ('A', 'Song')),
     ({'artist': 'A', 'track': 'Song (Official Video)'}, '', ('A', 'Song (Official Video)')),
     ({}, 'Artysta – Utwór (Official Video) [4K]', ('Artysta', 'Utwór')),
-    ({}, 'A — Song - Remix (Live) feat. B', ('A', 'Song - Remix (Live) feat. B')),
+    ({}, 'A — Song - Remix (Live) feat. B', ('A ft. B', 'Song - Remix (Live)')),
     ({'artist': 'A'}, 'a - Song', ('A', 'Song')),
     ({'track': 'Song'}, 'A - song', ('A', 'Song')),
     ({'track': 'Song'}, 'A - Different', ('', 'Song')),
@@ -30,6 +30,60 @@ from test_programmes import programme, insert, source, stamp
 def test_metadata(info, title, expected):
     result = music.caption(info, {'title': title})
     assert (result.artist, result.title) == expected
+
+
+@pytest.mark.parametrize('title,artist,track', [
+    ('Sound Of Walking Away X Divinity X Shelter (Music Video)', '',
+     'Sound Of Walking Away X Divinity X Shelter'),
+    ('Porter Robinson - Divinity ft. Amy Millan', 'Porter Robinson ft. Amy Millan', 'Divinity'),
+    ('Ninajirachi & Porter Robinson - WannaCry [Official Visualiser]',
+     'Ninajirachi & Porter Robinson', 'WannaCry'),
+    ("Enter Shikari - Sorry You're Not A Winner (Official Music Video)",
+     'Enter Shikari', "Sorry You're Not A Winner"),
+    ('Tourist - Live at Lost Village 2025', 'Tourist', 'Live at Lost Village 2025'),
+    ('Rezz, fknsyd - Let Me In (Official Video)', 'Rezz, fknsyd', 'Let Me In'),
+    # Real YouTube titles; source links are recorded in docs/music-heuristics.md.
+    ('Dua Lipa - Levitating Featuring DaBaby (Official Music Video)',
+     'Dua Lipa ft. DaBaby', 'Levitating'),
+    ('Depeche Mode - Enjoy the Silence (Official Video)', 'Depeche Mode', 'Enjoy the Silence'),
+    ('Porter Robinson - Divinity (feat. Amy Millan)', 'Porter Robinson ft. Amy Millan', 'Divinity'),
+    # Synthetic edge cases: preserve musical versions and meaningful punctuation.
+    ('A - Song (feat. B) (C Remix) [Official Audio]', 'A ft. B', 'Song (C Remix)'),
+    ('A - Song ft. B (C Remix)', 'A ft. B', 'Song (C Remix)'),
+    ('A - Song [FEAT. B & C] [Official Lyric Video] [4K]', 'A ft. B & C', 'Song'),
+    ('A - Song (Official Video) ft. B', 'A ft. B', 'Song'),
+    ('A ft. B - Song ft. B', 'A ft. B', 'Song'),
+    ('A - Song ft. B (feat. B)', 'A ft. B', 'Song'),
+    ('A - Song ft. B (feat. C)', 'A ft. B ft. C', 'Song'),
+    ('A feat. B - Song', 'A feat. B', 'Song'),
+    ('A - Song (Live at Wembley 1986)', 'A', 'Song (Live at Wembley 1986)'),
+    ('A - Song (Acoustic) [Lyrics]', 'A', 'Song (Acoustic)'),
+    ('A - Song (Remastered 2011)', 'A', 'Song (Remastered 2011)'),
+    ('A - Song (Radio Edit)', 'A', 'Song (Radio Edit)'),
+    ('A - Song (Official Visualizer)', 'A', 'Song'),
+    ('A - Song [HD] (Official Audio)', 'A', 'Song'),
+    ('A - Song (Unofficial Video)', 'A', 'Song (Unofficial Video)'),
+    ('AC/DC - T.N.T. (Official Video)', 'AC/DC', 'T.N.T.'),
+    ('blink-182 – All the Small Things [Music Video]', 'blink-182', 'All the Small Things'),
+    ('A — Song - Part II', 'A', 'Song - Part II'),
+    ('A x B - Song', 'A x B', 'Song'),
+    ('A - Song with B', 'A', 'Song with B'),
+    ('Song feat. B', '', 'Song feat. B'),
+    ('A-Song', '', 'A-Song'),
+    ('A - Song (feat.)', 'A', 'Song (feat.)'),
+    ('A - Song ft.', 'A', 'Song ft.'),
+    ('A - (feat. B)', 'A', '(feat. B)'),
+    ('A - Song (Official Video]', 'A', 'Song (Official Video]'),
+    ('A - Song (Live featuring B)', 'A', 'Song (Live featuring B)'),
+])
+def test_music_title_heuristics(title, artist, track):
+    assert music.caption({}, {'title': title}) == music.Caption(artist, track)
+    assert music.caption({'title': title}, {'title': 'Stale'}) == music.Caption(artist, track)
+
+
+def test_music_metadata_stays_authoritative_with_feature_credits():
+    assert music.caption({'artist': 'A', 'track': 'Song feat. B'},
+                         {'title': 'Other - Different'}) == music.Caption('A', 'Song feat. B')
 
 
 def test_filename_fallback_never_uses_resolved_url():
@@ -74,7 +128,7 @@ async def test_music_api_defaults_preservation_and_validation(client):
     assert (await client.put(path, json={**body, 'music': False})).json()['music'] is False
 
 
-def test_music_change_waits_for_next_emission_and_survives_restart(tmp_path):
+def test_music_change_applies_to_next_source_and_survives_restart(tmp_path):
     db = Database(tmp_path / 'state.db')
     insert(db, programme())
     source(db)
@@ -83,15 +137,41 @@ def test_music_change_waits_for_next_emission_and_survives_restart(tmp_path):
     first = timeline.sync()
     assert first.item['music'] is False
     db.execute('UPDATE programmes SET music=1')
-    assert timeline.sync().item['music'] is False
+    assert timeline.sync().item['music'] is True
     restored = ProgrammeTimeline(db, 'main', clock=lambda: now)
-    assert restored.sync().item['music'] is False
+    assert restored.sync().item['music'] is True
     assert restored.sync(now=now + 86400).item['music'] is True
     # Checkpoints written before this feature have no music field.
     for plan in restored.state['plans']:
         plan['block'].get('programme', {}).pop('music', None)
     restored.save()
     assert ProgrammeTimeline(db, 'main', clock=lambda: now + 86400).position().item['music'] is False
+    db.conn.close()
+
+
+@pytest.mark.parametrize('saved_music,current_music', [(None, True), (False, True), (True, False)])
+def test_music_repairs_stale_checkpoint_with_current_signature(tmp_path, saved_music, current_music):
+    db = Database(tmp_path / 'state.db')
+    insert(db, programme())
+    source(db)
+    db.execute('UPDATE programmes SET music=?', (int(current_music),))
+    now = stamp('2026-09-24T18:10')
+    timeline = ProgrammeTimeline(db, 'main', clock=lambda: now)
+    first = timeline.sync()
+    signature = timeline.state['signature']
+    for plan in timeline.state['plans']:
+        metadata = plan['block'].get('programme', {})
+        if saved_music is None:
+            metadata.pop('music', None)
+        else:
+            metadata['music'] = saved_music
+    timeline.save()
+    restored = ProgrammeTimeline(db, 'main', clock=lambda: now)
+    repaired = restored.sync()
+    assert restored.state['signature'] == signature
+    assert repaired.item['music'] is current_music
+    assert (repaired.key, repaired.starts_at, repaired.ends_at) == (first.key, first.starts_at, first.ends_at)
+    assert ProgrammeTimeline(db, 'main', clock=lambda: now).position().item['music'] is current_music
     db.conn.close()
 
 
@@ -157,8 +237,8 @@ def test_real_frames_layout_unicode_and_filter_characters(resolution, fps):
     bounds = image.getbbox()
     assert bounds
     width, height = image.size
-    assert bounds[0] >= int(width * .55) - 1
-    assert bounds[2] <= width * .95 + 1
+    assert bounds[0] >= int(width * .05) - 1
+    assert bounds[2] <= width * .45 + 1
     assert bounds[1] > height * .65
     assert bounds[3] <= height * .9 + 1
     face = music.font(music.BOLD_FONT, round(40 * height / 1080))

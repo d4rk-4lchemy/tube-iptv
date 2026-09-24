@@ -118,14 +118,27 @@ class ProgrammeTimeline:
         revoked = (current and current.item['url'] != BLACK_URL and not preserve_removed
                    and current.item['url'] not in {m['url'] for m in self.db.media(self.channel_id, current.item.get('programme_id'))})
         changed = signature != self.state['signature'] or retry_due or revoked
-        if not changed and self.state['plans'] and self.state['plans'][-1]['block']['ends_at'] > now + 3600:
-            return self.position(now)
         active = next((p for p in self.state['plans'] if p['starts_at'] <= now < p['ends_at']), None)
         ids = {p['id'] for p in self.programmes}
         if active and active['block']['programme_id'] and active['block']['programme_id'] not in ids:
             active = None
         if active and not active['block']['programme_id'] and programme_signature != self.state.get('programme_signature'):
             active = None
+        if active and active['block']['programme_id']:
+            current_programme = next((p for p in self.programmes if p['id'] == active['block']['programme_id']), None)
+            old_music = bool(active['block'].get('programme', {}).get('music', False))
+            new_music = bool(current_programme and current_programme.get('music', False))
+            if old_music != new_music:
+                # Older checkpoints can have a current signature but stale
+                # programme metadata. Repair them before the fast return.
+                changed = True
+                # Keep the current source/occurrence alive, but let the next
+                # source in this same occurrence see the updated caption flag.
+                active = deepcopy(active)
+                active['block']['programme'] = deepcopy(active['block'].get('programme', {}))
+                active['block']['programme']['music'] = new_music
+        if not changed and self.state['plans'] and self.state['plans'][-1]['block']['ends_at'] > now + 3600:
+            return self.position(now)
         held = active['block'] if active and active['block']['programme_id'] else None
         previous = [p for p in self.state['plans'] if p['ends_at'] <= now]
         if changed:
