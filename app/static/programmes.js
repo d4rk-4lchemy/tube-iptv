@@ -21,6 +21,8 @@ document.body.insertAdjacentHTML('beforeend', `
 <dialog id="programme-dialog" class="programme-dialog">
   <form id="programme-form"><h2 id="programme-editor-title">New programme</h2>
     <label for="programme-name">Programme name</label><input id="programme-name" required maxlength="120">
+    <label class="programme-music" for="programme-music"><span>Music</span><input id="programme-music" type="checkbox" role="switch"></label>
+    <p class="field-hint">Show artist and song captions on each clip. Changes apply from the next programme emission.</p>
     <label for="programme-duration">Duration in local minutes</label><input id="programme-duration" type="number" min="1" max="1440" step="1" required value="60">
     <p class="field-hint">Films may finish up to 5 minutes late. If none fits, the last film is cut at the planned end. Clock changes preserve local start and end times.</p>
     <h3>Weekly times</h3><div id="programme-rules"></div><button type="button" class="button small" id="add-programme-rule">Add time +</button>
@@ -45,7 +47,7 @@ function fullTime(timestamp) {
 }
 function renderList() {
   $('programme-count').textContent = rows.length;
-  $('programme-list').innerHTML = rows.length ? rows.map(p => `<article class="programme-row"><div><h3>${escape(p.name)}</h3><p class="field-hint">${p.duration_minutes} min · ${p.sources.length} sources</p><p class="mono">${p.rules.map(r => `${r.weekdays.map(d => names[d].slice(0, 3)).join(', ')} ${escape(r.time)}`).join('<br>')}</p></div><div class="programme-actions"><button class="button small" data-edit="${escape(p.id)}">Edit</button><button class="button small" data-remove="${escape(p.id)}">Remove</button></div></article>`).join('') : '<p class="empty">No weekly programmes. Add one to build a weekly schedule.</p>';
+  $('programme-list').innerHTML = rows.length ? rows.map(p => `<article class="programme-row"><div><h3>${escape(p.name)}</h3><p class="field-hint">${p.duration_minutes} min · ${p.sources.length} sources${p.music ? ' · Music' : ''}</p><p class="mono">${p.rules.map(r => `${r.weekdays.map(d => names[d].slice(0, 3)).join(', ')} ${escape(r.time)}`).join('<br>')}</p></div><div class="programme-actions"><button class="button small" data-edit="${escape(p.id)}">Edit</button><button class="button small" data-remove="${escape(p.id)}">Remove</button></div></article>`).join('') : '<p class="empty">No weekly programmes. Add one to build a weekly schedule.</p>';
 }
 function renderGrid() {
   if (!calendar || dragging) return;
@@ -104,6 +106,7 @@ function openEditor(id = null) {
   const p = rows.find(row => row.id === id);
   $('programme-editor-title').textContent = p ? 'Edit programme' : 'New programme';
   $('programme-name').value = p?.name || '';
+  $('programme-music').checked = !!p?.music;
   $('programme-duration').value = p?.duration_minutes || 60;
   $('programme-rules').innerHTML = '';
   (p?.rules || [{ weekdays: [0, 1, 2, 3, 4, 5, 6], time: '18:00' }]).forEach(addRule);
@@ -128,7 +131,7 @@ $('programme-rules').onclick = event => {
 };
 $('programme-form').onsubmit = event => {
   event.preventDefault(); action(async () => {
-    const payload = { name: $('programme-name').value, duration_minutes: Number($('programme-duration').value), rules: readRules() };
+    const payload = { name: $('programme-name').value, music: $('programme-music').checked, duration_minutes: Number($('programme-duration').value), rules: readRules() };
     $('save-programme').disabled = true;
     try {
       const result = await api(`channels/${editorChannel}/programmes${editing ? '/' + editing : ''}`, { method: editing ? 'PUT' : 'POST', body: JSON.stringify(payload) });
@@ -202,7 +205,7 @@ $('schedule-grid').ondrop = event => {
   rules.push({ weekdays: [day.weekday], time: localTime(timestamp) });
   action(async () => {
     try {
-      await api(`${path()}/programmes/${programme.id}`, { method: 'PUT', body: JSON.stringify({ name: programme.name, duration_minutes: programme.duration_minutes, rules }) });
+      await api(`${path()}/programmes/${programme.id}`, { method: 'PUT', body: JSON.stringify({ name: programme.name, music: programme.music, duration_minutes: programme.duration_minutes, rules }) });
       toast(`Weekly emission moved to ${names[day.weekday]} ${localTime(timestamp)}.`);
     } finally { await refresh(true); }
   });

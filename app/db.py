@@ -30,6 +30,8 @@ class Database:
             name TEXT NOT NULL, duration_minutes INTEGER NOT NULL, rules TEXT NOT NULL);
         """)
         self._migrate_sources()
+        if 'music' not in {r['name'] for r in self.rows('PRAGMA table_info(programmes)')}:
+            self.conn.execute('ALTER TABLE programmes ADD COLUMN music INTEGER NOT NULL DEFAULT 0')
         self.conn.execute("UPDATE sources SET state='error', error='Interrupted by a restart. Refresh the source.' WHERE state='pending'")
         self.conn.commit()
 
@@ -70,7 +72,7 @@ class Database:
 
     def programmes(self, channel="main"):
         rows = self.rows('SELECT * FROM programmes WHERE channel_id=? ORDER BY rowid', (channel,))
-        return [{**row, 'rules': json.loads(row['rules'])} for row in rows]
+        return [{**row, 'music': bool(row['music']), 'rules': json.loads(row['rules'])} for row in rows]
 
     def sources(self, channel="main", programme_id=None, all_sources=False):
         return self.rows("""SELECT s.*, COUNT(m.id) AS count FROM sources s LEFT JOIN media m

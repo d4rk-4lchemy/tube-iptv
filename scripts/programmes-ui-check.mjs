@@ -13,9 +13,11 @@ try {
   await page.locator('#new-programme').click();
   await page.locator('#programme-name').fill('Weekly test');
   await page.locator('#programme-duration').fill('60');
+  await page.locator('#programme-music').check();
   await page.locator('#programme-rules input[type=time]').fill('18:00');
   await page.locator('#save-programme').click();
   await expect(page.locator('#programme-list')).toContainText('Weekly test');
+  await expect(page.locator('#programme-list')).toContainText('Music');
   await page.locator('#close-programme').click();
   await expect(page.locator('.schedule-block[draggable=true]')).toHaveCount(7);
   const data = await page.evaluate(async () => (await fetch('/api/channels/main/schedule')).json());
@@ -31,6 +33,11 @@ try {
   await save;
   const programmes = await (await page.request.get(base + '/api/channels/main/programmes')).json();
   expect(programmes[0].rules).toHaveLength(2);
+  expect(programmes[0].music).toBe(true);
+  await page.locator('[data-edit]').first().click();
+  await expect(page.locator('#programme-music')).toBeChecked();
+  await page.screenshot({ path: 'artifacts/programme-music-editor.png' });
+  await page.locator('#close-programme').click();
   expect(programmes[0].rules.find(r => r.time === '20:00').weekdays).toEqual([2]);
   expect(programmes[0].rules.find(r => r.time === '18:00').weekdays).toEqual([0, 1, 3, 4, 5, 6]);
   console.log('PASS: programme form and drag split one weekday from a weekly rule');

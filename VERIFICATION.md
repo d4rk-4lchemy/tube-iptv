@@ -1,5 +1,15 @@
 # Weryfikacja
 
+## Music captions — 2026-09-24
+
+- `uv run pytest -q`: **193 passed**. Music tests cover metadata and conservative title fallback, literal FFmpeg escaping, migration/API compatibility, delayed activation and restart checkpoints, merged intervals/fades, seek offsets, and rendered layout at 480p/720p/1080p/4K. Existing frame-timing tests now run with captions enabled, including VFR and fractional FPS.
+- `PATH="/usr/bin:$PATH" uv run pytest -q tests/test_music.py`: **35 passed** using Debian FFmpeg 5.1.9, in addition to the local FFmpeg 7.1.3 run.
+- On an isolated Uvicorn instance with a fresh temporary data directory: `programmes-ui-check.mjs` passed (Music create/edit/drag persistence, Chromium desktop/mobile, no JS errors), and `programmes-check.py` passed with real yt-dlp/FFmpeg/HLS, decoded caption pixels, synthetic black/silence, transitions and bounded buffers. Test instance stopped afterward.
+- Actual short H.264 encoding and decoded caption checks passed on Intel `/dev/dri/renderD128` for **VAAPI and QSV** using local FFmpeg 7.1.3. NVENC command/filter order is covered by tests; no NVIDIA hardware encoding or GPU HLS endurance test was performed. Docker daemon was unavailable, so no new container image was built.
+- Artifacts: `artifacts/programme-music-editor.png`, `artifacts/programmes-desktop.png`, `artifacts/programmes-mobile.png`, `artifacts/music-hls-caption.png`. `git diff --check` and JavaScript syntax validation passed.
+
+## Historical baseline
+
 Sprawdzone w środowisku przygotowania aplikacji, 2026-09-23:
 
 - `uv run pytest -q`: **10 testów zaliczonych** — walidacja źródeł, duplikaty, kaskadowe usuwanie, losowanie, ciągłość numeracji HLS i znaczniki discontinuity, limity bufora, zatrzymanie po ostatnim widzu, uwierzytelnianie, ochrona endpointu ingest, błędna aktualizacja i powrót nightly → stable.

@@ -44,6 +44,7 @@ class RuleInput(BaseModel):
 
 
 class ProgrammeInput(BaseModel):
+    music: bool = Field(default=False, strict=True)
     name: str = Field(min_length=1, max_length=120)
     duration_minutes: int = Field(strict=True, ge=1, le=1440)
     rules: list[RuleInput] = Field(min_length=1, max_length=32)
@@ -60,6 +61,9 @@ class ProgrammeInput(BaseModel):
 def prepare(request, channel_id, payload, programme_id):
     channel = channel_for(request, channel_id)
     programme = {'id': programme_id, 'channel_id': channel_id, **payload.model_dump()}
+    if 'music' not in payload.model_fields_set:
+        existing = next((p for p in request.app.state.db.programmes(channel_id) if p['id'] == programme_id), None)
+        programme['music'] = existing['music'] if existing else False
     for rule in programme['rules']:
         rule['id'] = rule['id'] or secrets.token_hex(12)
     if len({r['id'] for r in programme['rules']}) != len(programme['rules']):
@@ -91,8 +95,8 @@ async def list_programmes(channel_id: str, request: Request):
 async def create_programme(channel_id: str, payload: ProgrammeInput, request: Request):
     """Create a weekly programme. Empty/pending source pools air black with silence."""
     programme = prepare(request, channel_id, payload, secrets.token_hex(12))
-    request.app.state.db.execute('INSERT INTO programmes VALUES(?,?,?,?,?)',
-        (programme['id'], channel_id, programme['name'], programme['duration_minutes'], json.dumps(programme['rules'])))
+    request.app.state.db.execute('INSERT INTO programmes(id,channel_id,name,duration_minutes,rules,music) VALUES(?,?,?,?,?,?)',
+        (programme['id'], channel_id, programme['name'], programme['duration_minutes'], json.dumps(programme['rules']), programme['music']))
     await channel_for(request, channel_id).programmes_changed()
     return with_sources(request, programme)
 
@@ -108,8 +112,8 @@ async def update_programme(channel_id: str, programme_id: str, payload: Programm
     """Replace name, duration and weekly rules atomically; preserve the current emission."""
     programme_for(request, channel_id, programme_id)
     programme = prepare(request, channel_id, payload, programme_id)
-    request.app.state.db.execute('UPDATE programmes SET name=?,duration_minutes=?,rules=? WHERE id=?',
-        (programme['name'], programme['duration_minutes'], json.dumps(programme['rules']), programme_id))
+    request.app.state.db.execute('UPDATE programmes SET name=?,duration_minutes=?,rules=?,music=? WHERE id=?',
+        (programme['name'], programme['duration_minutes'], json.dumps(programme['rules']), programme['music'], programme_id))
     await channel_for(request, channel_id).programmes_changed()
     return with_sources(request, programme)
 

@@ -36,12 +36,18 @@
 .schedule-tick { position:absolute; left:2px; right:0; font:8px monospace; color:#555; pointer-events:none; }
 .schedule-tick span { position:relative; top:1px; background:#f8f7f0; }
 .schedule-block { position:absolute; left:49px; right:3px; border:1px solid #446949; border-radius:4px; background:#d4e5b6; padding:3px; text-align:left; overflow:hidden; color:#17321b; cursor:grab; min-width:0; }
-.schedule-block:focus-visible { outline:3px solid #1262a3; z-index:2; }
+.schedule-block:focus-visible { outline:3px solid var(--olive); z-index:2; }
 .schedule-block strong,.schedule-block span { display:block; font-size:10px; line-height:1.3; overflow-wrap:anywhere; }
 .schedule-gap { background:#efeee6; color:#777; border-color:#ddd; cursor:default; opacity:.8; }
 .schedule-gap strong { font-weight:normal; }
 .programme-dialog { width:min(700px,calc(100vw - 32px)); max-height:90vh; overflow:auto; }
 .programme-dialog input[type=number] { width:150px; }
+.programme-dialog #programme-name { margin-bottom:8px; }
+.programme-dialog .programme-music { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:18px; cursor:pointer; font:12px/1.5 Arial,Helvetica,sans-serif; letter-spacing:0; color:var(--ink); }
+.programme-dialog .programme-music input { appearance:none; width:36px; height:22px; flex-shrink:0; margin:0; padding:2px; border:1px solid var(--muted); border-radius:12px; background:var(--canvas); cursor:pointer; }
+.programme-dialog .programme-music input::before { content:''; display:block; width:16px; height:16px; border-radius:50%; background:var(--muted); transition:transform .15s; }
+.programme-dialog .programme-music input:checked { background:var(--accent); border-color:var(--accent); }
+.programme-dialog .programme-music input:checked::before { background:#202b24; transform:translateX(14px); }
 .programme-rule { min-width:0; margin:12px 0; border:1px solid var(--line); padding:12px; }
 .rule-time { display:flex; flex-wrap:wrap; gap:16px; align-items:center; }
 .rule-time > label { display:flex; gap:8px; align-items:center; margin:0; }
@@ -58,7 +64,7 @@
 .programme-source.disabled { opacity:.6; }
 @media(max-width:600px) { .programme-row { flex-direction:column; } .schedule-scroll { max-height:540px; } }
 
-.cookie-actions{display:flex;gap:8px;margin-top:18px}.cookie-actions .button{flex:1;padding:10px 6px;font-size:11px}
+.cookie-actions{display:flex;gap:8px;margin-top:18px}.cookie-actions .button{flex:1;padding:10px 6px;font-size:11px}.engine .update-status{margin-top:10px}.engine .cookie-hint{margin-top:8px}
 
 /* Theme preference is applied before the first paint. */
 :root { color-scheme:light; }
@@ -74,6 +80,20 @@ input,select,textarea { color:var(--ink); }
 .theme-switch input:checked { background:var(--accent); border-color:var(--accent); }
 .theme-switch input:checked::before { background:#202b24; transform:translateX(14px); }
 .theme-switch input:focus-visible { outline:2px solid var(--olive); }
+.schedule-block:focus-visible,
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible { outline:2px solid var(--olive); outline-offset:3px; }
+button:focus,
+a:focus,
+input:focus,
+select:focus,
+textarea:focus { outline:none; }
+input:focus,
+select:focus,
+textarea:focus { border-color:var(--olive); }
 .rail nav { margin-top:18px; }
 :root[data-theme=dark] .nav-item.active,
 :root[data-theme=dark] .button.primary { color:#202b24; }

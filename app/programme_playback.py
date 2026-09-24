@@ -195,6 +195,7 @@ class ProgrammeTimeline:
                 slot = self._position(plan, now)
                 if slot:
                     return Slot({**slot.item, 'programme_id': plan['block']['programme_id'],
+                                 'music': bool(plan['block'].get('programme', {}).get('music', False)),
                                  'programme_title': plan['block']['title'], 'occurrence_id': plan['block']['id'],
                                  'programme_starts_at': plan['block']['starts_at'],
                                  'programme_ends_at': plan['block']['ends_at'],

@@ -8,6 +8,7 @@ from fractions import Fraction
 import pytest
 
 from app.engine import ffmpeg_command
+from app.music import Caption
 
 
 def encode_frames(command):
@@ -31,7 +32,8 @@ def encode_frames(command):
 ])
 def test_frame_timing_and_four_second_keyframes(source_fps, fps):
     command = ffmpeg_command([], {}, 'http://localhost/unused',
-                             encoder='software', duration=4.2, fps=fps)
+                             encoder='software', duration=4.2, fps=fps,
+                             music_caption=Caption('Artist', 'Song'), music_end=30)
     # Substitute a synthetic input; retain the production filters and encoder.
     index = next(i for i, value in enumerate(command) if value.startswith('color='))
     if source_fps == 'variable':

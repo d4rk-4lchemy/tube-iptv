@@ -9,7 +9,7 @@ import re
 import secrets
 import time
 from urllib.parse import quote
-from . import config, gpu
+from . import config, gpu, music
 from .process import stop_process
 from .video import RESOLUTIONS
 from .timeline import Timeline, known_duration
@@ -31,7 +31,7 @@ class Segment:
     source_url: str | None = None
 
 
-def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duration=None, fps=60, resolution="1080p", device=None, target_bitrate=None):
+def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duration=None, fps=60, resolution="1080p", device=None, target_bitrate=None, music_caption=None, music_end=None):
     width, height, bitrate, maxrate = RESOLUTIONS[resolution]
     if target_bitrate is not None:
         bitrate = target_bitrate
@@ -74,6 +74,10 @@ def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duratio
                f"setsar=1,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black")
     if fps != "original":
         filters += f",fps={fps}"
+    if music_caption and not info.get('is_live') and not info.get('synthetic_black'):
+        overlay = music.filters(music_caption, width, height, offset, music_end)
+        if overlay:
+            filters += ',' + overlay
     cmd += ["-map", f"{video_index}:v:0", "-map", f"{audio_index}:a:0", "-shortest"]
     if encoder == "vaapi":
         cmd += ["-vf", filters + ",format=nv12,hwupload", "-c:v", "h264_vaapi"]
@@ -445,7 +449,13 @@ class Channel:
                     self.clip_time = max(time.time(), self.media_buffer.tail_deadline or 0)
                     self.prefetch_task = asyncio.create_task(self.prefetch_next(slot))
                     destination = f"{self.upload_base}/{self.clip}"
-                    command = ffmpeg_command(formats, info, destination, offset=offset, duration=remaining, fps=self.fps, resolution=resolution, target_bitrate=self.target_bitrate, **gpu.settings(self.db))
+                    music_caption = (music.caption(info, item) if item.get('music')
+                                     and item['url'] != BLACK_URL and not info.get('is_live') else None)
+                    music_end = (slot.ends_at - slot.starts_at if not item.get('estimated')
+                                 or slot.ends_at >= item.get('programme_ends_at', float('inf')) else None)
+                    command = ffmpeg_command(formats, info, destination, offset=offset, duration=remaining,
+                                             fps=self.fps, resolution=resolution, target_bitrate=self.target_bitrate,
+                                             music_caption=music_caption, music_end=music_end, **gpu.settings(self.db))
                     self.event(f"On air: {item['title']} · joining at {int(offset)}s")
                     self.ffmpeg_started = time.monotonic()
                     self.startup_started = started

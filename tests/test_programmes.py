@@ -21,7 +21,7 @@ def programme(name='Show', at='18:00', minutes=60, days=None, id='p'):
 
 
 def insert(db, value):
-    db.execute('INSERT INTO programmes VALUES(?,?,?,?,?)', (value['id'], value['channel_id'], value['name'], value['duration_minutes'], json.dumps(value['rules'])))
+    db.execute('INSERT INTO programmes(id,channel_id,name,duration_minutes,rules) VALUES(?,?,?,?,?)', (value['id'], value['channel_id'], value['name'], value['duration_minutes'], json.dumps(value['rules'])))
 
 
 def source(db, id='s', owner='p', durations=(600, 700)):

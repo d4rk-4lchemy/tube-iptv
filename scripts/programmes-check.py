@@ -15,6 +15,7 @@ import time
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 import httpx
+from PIL import Image, ImageChops
 from media_fixture import MediaHandler
 
 BASE = os.getenv('TUBE_URL', 'http://127.0.0.1:8003')
@@ -26,7 +27,7 @@ async def main():
         subprocess.run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
             'color=c=red:s=320x180:r=24', '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
             '-t', '9', '-c:v', 'libx264', '-threads', '1', '-pix_fmt', 'yuv420p', '-c:a', 'aac',
-            '-movflags', '+faststart', str(Path(directory) / 'clip.mp4')], check=True)
+            '-movflags', '+faststart', str(Path(directory) / 'Fixture Artist - Fixture Song.mp4')], check=True)
         server = ThreadingHTTPServer(('0.0.0.0', 8773), partial(MediaHandler, directory=directory))
         threading.Thread(target=server.serve_forever, daemon=True).start()
         async with httpx.AsyncClient(timeout=100) as client:
@@ -39,7 +40,7 @@ async def main():
             await client.patch(BASE + '/api/settings', json={'fps': 24, 'resolution': '480p'})
             local = datetime.now(ZoneInfo(status['timezone']))
             at = local.replace(second=0, microsecond=0) - timedelta(minutes=1)
-            programme = await write('/api/channels/main/programmes', {'name': 'Integration programme', 'duration_minutes': 3,
+            programme = await write('/api/channels/main/programmes', {'name': 'Integration programme', 'duration_minutes': 3, 'music': True,
                 'rules': [{'weekdays': [at.weekday()], 'time': at.strftime('%H:%M')}]})
             path = '/api/channels/main/programmes/' + programme['id']
             stream = '/channels/main/index.m3u8?viewer=programme-check'
@@ -80,7 +81,7 @@ async def main():
                 '-f', 's16le', 'pipe:1'], input=segment.content, capture_output=True, check=True).stdout
             assert sound and not any(sound), 'Black output must have silent audio'
             print('PASS: empty programme produces decoded black pixels and silent H.264/AAC in RAM', flush=True)
-            source = await write(path + '/sources', {'url': f'http://{HOST}:8773/clip.mp4'})
+            source = await write(path + '/sources', {'url': f'http://{HOST}:8773/Fixture%20Artist%20-%20Fixture%20Song.mp4'})
             seen.clear()  # Source activation intentionally replaces the empty slate.
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline:
@@ -93,8 +94,31 @@ async def main():
             assert s['now']['programme_title'] == 'Integration programme'
             print('PASS: newly available programme source replaces black; programme identity remains', flush=True)
             deadline = time.monotonic() + 35
+            caption_seen = False
+            checked_segments = set()
             while time.monotonic() < deadline:
-                await sample()
+                manifest = (await sample()).text
+                segment_url = [line for line in manifest.splitlines() if line.startswith('segments/')][-1]
+                if not caption_seen and segment_url not in checked_segments:
+                    checked_segments.add(segment_url)
+                    segment = await client.get(urljoin(BASE + stream, segment_url))
+                    segment.raise_for_status()
+                    pixels = subprocess.run(['ffmpeg', '-v', 'error', '-i', 'pipe:0', '-map', '0:v:0',
+                        '-vf', 'fps=2', '-pix_fmt', 'rgb24', '-f', 'rawvideo', 'pipe:1'],
+                        input=segment.content, capture_output=True, check=True).stdout
+                    frame_size = 854 * 480 * 3
+                    for offset in range(0, len(pixels), frame_size):
+                        image = Image.frombytes('RGB', (854, 480), pixels[offset:offset + frame_size])
+                        red, green, blue = image.split()
+                        white = ImageChops.darker(ImageChops.darker(red, green), blue).point(lambda v: 255 if v > 190 else 0)
+                        bounds = white.getbbox()
+                        if bounds and image.getpixel((0, 0))[0] > 150:
+                            assert bounds[0] >= 854 * .55 - 1 and bounds[2] <= 854 * .95 + 1, bounds
+                            assert bounds[1] > 480 * .65 and bounds[3] < 480 * .9 + 1, bounds
+                            Path('artifacts').mkdir(exist_ok=True)
+                            image.save('artifacts/music-hls-caption.png')
+                            caption_seen = True
+                            break
                 s = (await get('/api/status')).json()
                 assert s['now']['kind'] == 'video', s
                 assert s['buffer_bytes'] <= 192 * 1024 * 1024
@@ -105,6 +129,8 @@ async def main():
                 if right == left + 1:
                     assert next_start >= start + duration - .002, (left, right, start, duration, next_start)
             assert len(seen) >= 8
+            assert caption_seen, 'Music caption was not found in decoded HLS frames'
+            print('PASS: Music artist/title caption decoded from HLS in the lower-right safe area', flush=True)
             xml = (await get('/epg.xml')).text
             assert '<title>Integration programme</title>' in xml and '<title>No planned programme</title>' in xml
             assert '<title>clip</title>' not in xml

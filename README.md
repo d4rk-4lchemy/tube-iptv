@@ -80,6 +80,16 @@ Set `TZ` to an IANA timezone in `.env` or Compose, for example `TZ=Europe/Warsaw
 
 Weekly rules currently have no single-date overrides, priorities, episode ordering or automatic playlist refresh. Use **Refresh** on a source to update its extracted media.
 
+#### Music captions
+
+Select **Music** in a programme's editor to burn artist and song information into every non-live clip, including audio-only sources. Captions are part of the HLS picture in all players. Existing programmes default to off; changing Music applies from the next emission, including after a restart. General Sources used between programmes, loading screens, synthetic black and live sources have no captions.
+
+The artist appears above the bold song title in white DejaVu Sans with a black outline. The left-aligned block occupies the lower-right safe area (55–95% of picture width, bottom margin 10%). Artist names occupy one line; titles wrap to two lines and overflow ends with an ellipsis. Sizes scale with output resolution; the style is fixed in this version.
+
+Captions appear at seconds 3–13 and from 13 seconds before the clip's scheduled broadcast end until 3 seconds before it. Each interval includes 0.3-second fades. Planned cuts and permitted overruns determine the end; joining or recovering a stream does not restart the caption clock. Overlapping/touching intervals merge, leaving the first and last three seconds clear; clips up to six seconds have no caption. Unknown-length VOD gets the first interval and an end interval only when its scheduled cut is known. Unexpected source failures cannot be anticipated.
+
+The existing playback extraction supplies yt-dlp `artists`/`artist` and `track` metadata. Missing fields fall back conservatively to `Artist - Song` titles (also spaced en/em dashes); conflicting partial metadata is not combined. Recognized trailing tags such as `(Official Video)` and `[4K]` are removed from fallback titles, while remix/live/featured-artist labels remain. If no artist is known, only the title appears. Uploaders are not treated as artists. As a last resort, direct media URLs can supply their filename, excluding query parameters; resolved CDN URLs are never used. No additional extraction or media download is required.
+
 #### Programme API
 
 All endpoints below use the existing admin authentication and origin protection. IDs are scoped to their channel. The browser uses the same API.
@@ -100,6 +110,7 @@ Example programme body (weekdays use Monday = 0 through Sunday = 6):
 ```json
 {
   "name": "Evening show",
+  "music": false,
   "duration_minutes": 60,
   "rules": [
     {"weekdays": [0, 1, 2, 3, 4], "time": "18:00"},
@@ -109,6 +120,8 @@ Example programme body (weekdays use Monday = 0 through Sunday = 6):
 ```
 
 Responses assign stable programme/rule IDs. Include existing rule IDs when retaining rules in an update; omit the ID for a new rule. Source IDs work with the existing `/api/sources/{source_id}` deletion, enable/disable and refresh endpoints. Conflicts return HTTP 409; invalid fields return 422. The status response includes `schedule_mode`, `timezone`, `gap_mode`, the nominal `programme`, `actual_programme`, and the current film in `now`. The existing stream, playlist and EPG URLs are unchanged.
+
+Programme responses include the boolean `music`. Creating a programme without it defaults to `false`; omitting it from an update preserves its previous value. Explicit values must be JSON booleans. The calendar drag operation preserves this flag.
 
 ### Configuration
 
