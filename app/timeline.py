@@ -1,5 +1,6 @@
 """A persistent, wall-clock schedule. Computing a position never opens media URLs."""
 from dataclasses import dataclass
+from copy import copy, deepcopy
 import math
 import random
 import secrets
@@ -31,6 +32,39 @@ class Timeline:
         self.db, self.clock = db, clock
         self.key = f'timeline:{channel_id}'
         self.state = db.setting(self.key) or None
+
+    def snapshot(self):
+        """Detach a schedule for read-only use outside the application thread."""
+        snapshot = copy(self)
+        snapshot.state = deepcopy(self.state)
+        snapshot.db = None
+        return snapshot
+
+    def slots(self, starts_at, ends_at):
+        """Yield complete slots intersecting [starts_at, ends_at), without writes.
+
+        Walk each shuffled cycle once, rather than re-shuffling for every slot.
+        Call on a snapshot when the iterator outlives the current event-loop turn.
+        """
+        if not self.state or ends_at <= starts_at:
+            return
+        lead = self.state['lead']
+        if lead and lead['starts_at'] < ends_at and lead['ends_at'] > starts_at:
+            yield Slot(**lead)
+        total = sum(item['duration'] for item in self.state['pool'])
+        if not total:
+            return
+        epoch = self.state['epoch']
+        cycle = int(max(0.0, starts_at - epoch) // total)
+        while (start := epoch + cycle * total) < ends_at:
+            for item in self._order(cycle):
+                end = start + item['duration']
+                if start >= ends_at:
+                    return
+                if end > starts_at:
+                    yield Slot(item, start, end)
+                start = end
+            cycle += 1
 
     def sync(self, items, now=None, preserve_removed=False):
         now = self.clock() if now is None else now

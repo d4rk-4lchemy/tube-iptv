@@ -13,3 +13,5 @@
 .delivery .button.primary{width:100%;justify-content:space-between;margin-top:8px}
 @media(min-width:701px) and (max-width:1150px){.channel-settings-grid{grid-template-columns:1fr}}
 @media(max-width:540px){.channel-settings-grid{grid-template-columns:1fr}.channel-settings .section-heading{align-items:flex-start;flex-direction:column;gap:6px}}
+
+.delivery select{width:100%;background:var(--paper);padding:10px;border:1px solid var(--line);border-radius:0;font-size:12px}

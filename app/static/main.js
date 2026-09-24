@@ -34,6 +34,8 @@ function render(data) {
   $('source-count').textContent = data.sources.length;
   $('playlist-url').value = data.playlist_url;
   $('download-playlist').href = data.playlist_url;
+  $('epg-url').value = data.epg_url;
+  if (!$('epg-days').disabled) $('epg-days').value = String(data.epg_days);
   $('current-channel').textContent = data.yt_dlp.channel;
   $('current-version').textContent = data.yt_dlp.version;
   $('encoder-label').textContent = `H.264 / AAC · ${data.encoder.toUpperCase()}`;
@@ -140,6 +142,26 @@ async function copyPlaylist() {
   catch { $('playlist-url').focus(); $('playlist-url').select(); toast('URL selected. Copy it with Ctrl+C or your browser menu.'); }
 }
 $('copy-playlist').onclick = copyPlaylist; $('copy-url').onclick = copyPlaylist;
+$('copy-epg').onclick = async () => {
+  if (!state) return;
+  try { await navigator.clipboard.writeText(state.epg_url); toast('EPG URL copied'); }
+  catch { $('epg-url').focus(); $('epg-url').select(); toast('URL selected. Copy it with Ctrl+C or your browser menu.'); }
+};
+$('epg-days').onchange = () => {
+  const input = $('epg-days');
+  const previous = state?.epg_days ?? 2;
+  const days = Number(input.value);
+  input.disabled = true;
+  ++refreshRequest;
+  action(async () => {
+    try {
+      const saved = await api('epg/settings', { method: 'PATCH', body: JSON.stringify({ days }) });
+      if (state) state.epg_days = saved.days;
+      toast('EPG horizon saved for all channels.');
+    } catch (error) { input.value = String(previous); throw error; }
+    finally { ++refreshRequest; input.disabled = false; await refresh(); }
+  });
+};
 $('start-preview').onclick = () => { if (state) startPreview(state.stream_url); };
 let releaseRequest = 0;
 async function loadVersions() {

@@ -6,6 +6,26 @@ try {
   page.on('pageerror', error => errors.push(error.message));
   await page.goto(process.env.TUBE_URL || 'http://127.0.0.1:8000');
   await expect(page.getByText('Server connected')).toBeVisible();
+  const epgDays = page.getByLabel('EPG horizon', { exact: true });
+  await expect(epgDays).toHaveValue('2');
+  await epgDays.selectOption('7');
+  await expect(epgDays).toBeEnabled();
+  await page.reload();
+  await expect(epgDays).toHaveValue('7');
+  await page.route('**/api/epg/settings', route => route.request().method() === 'PATCH'
+    ? route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ detail: 'Test save failure' }) })
+    : route.continue());
+  await epgDays.selectOption('3');
+  await expect(epgDays).toBeEnabled();
+  await expect(epgDays).toHaveValue('7');
+  await expect(page.locator('#toast')).toHaveText('Test save failure');
+  await page.unroute('**/api/epg/settings');
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.getByRole('button', { name: 'Copy EPG URL' }).click();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(await page.locator('#epg-url').inputValue());
+  await page.evaluate(() => { navigator.clipboard.writeText = async () => { throw new Error('Clipboard denied'); }; });
+  await page.getByRole('button', { name: 'Copy EPG URL' }).click();
+  expect(await page.locator('#epg-url').evaluate(input => input.selectionEnd - input.selectionStart)).toBe((await page.locator('#epg-url').inputValue()).length);
   const originalName = await page.locator('h1').textContent();
   await page.getByRole('button', { name: 'Rename channel' }).click();
   await page.getByLabel('Name displayed in the IPTV playlist').fill('Test / 02');
@@ -32,6 +52,7 @@ try {
   await page.getByRole('button', { name: 'Save', exact: true }).click();
   await expect(page.locator('h1')).toHaveText('Documentaries / 02');
   const secondChannel = await page.locator('#channel-select').inputValue();
+  await expect(epgDays).toHaveValue('7');
   const resolution = page.getByLabel('Resolution', { exact: true });
   await expect(resolution).toHaveValue('1080p');
   await resolution.selectOption('4k');
@@ -61,7 +82,13 @@ try {
   await expect(fps).toHaveValue('original');
   await expect(resolution).toHaveValue('4k');
   const playlist = await page.request.get(await page.locator('#playlist-url').inputValue());
-  expect((await playlist.text()).match(/#EXTINF:/g)).toHaveLength(2);
+  const playlistText = await playlist.text();
+  expect(playlistText.match(/#EXTINF:/g)).toHaveLength(2);
+  const epgURL = await page.locator('#epg-url').inputValue();
+  expect(playlistText).toContain(`x-tvg-url="${epgURL}"`);
+  const epgResponse = await page.request.get(epgURL);
+  expect(epgResponse.status()).toBe(200);
+  expect((await epgResponse.text()).match(/<channel /g)).toHaveLength(2);
   await page.screenshot({ path: 'artifacts/desktop.png', fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) throw new Error('Mobile horizontal overflow');
@@ -73,6 +100,8 @@ try {
   await expect(fps).toHaveValue('25');
   await fps.selectOption('60');
   await expect(fps).toBeEnabled();
+  await epgDays.selectOption('2');
+  await expect(epgDays).toBeEnabled();
   if (errors.length) throw new Error(errors.join('\n'));
-  console.log('PASS: desktop/mobile UI, channel creation/switching/removal, isolated settings, playlist, rename, stable/nightly dropdowns, no JS errors');
+  console.log('PASS: desktop/mobile UI, channels, settings, XMLTV export/horizon/copy/error recovery, playlist, rename, stable/nightly dropdowns, no JS errors');
 } finally { await browser.close(); }

@@ -9,11 +9,11 @@ from urllib.parse import quote, urlparse
 from pathlib import Path
 from typing import Literal
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.requests import ClientDisconnect
 from pydantic import BaseModel, Field
-from . import config, gpu
+from . import config, epg, gpu
 from .db import Database
 from .engine import Channel, MAX_SEGMENT
 from .sources import Sources, validate_url
@@ -109,6 +109,8 @@ async def status(request: Request, channel_id: str = 'main'):
             "yt_dlp": {k: v for k, v in state.versions.current().items() if k != "path"},
             "update": state.versions.job,
             "playlist_url": base_url(request) + "/playlist.m3u8" + token_suffix(),
+            "epg_url": epg_url(request),
+            "epg_days": epg.settings(state.db)['days'],
             "stream_url": base_url(request) + f"/channels/{channel_id}/index.m3u8" + token_suffix()}
 
 
@@ -309,10 +311,49 @@ def check_stream(request):
         raise HTTPException(403, "Invalid stream token")
 
 
+def epg_url(request):
+    return base_url(request) + '/epg.xml' + token_suffix()
+
+
+class EPGSettings(BaseModel):
+    days: int = Field(strict=True, ge=1, le=7)
+
+
+@app.get('/api/epg/settings')
+async def epg_settings(request: Request):
+    return epg.settings(request.app.state.db)
+
+
+@app.patch('/api/epg/settings')
+async def update_epg_settings(payload: EPGSettings, request: Request):
+    request.app.state.db.set_setting('epg_days', payload.days)
+    return epg.settings(request.app.state.db)
+
+
+@app.get('/epg.xml')
+async def guide(request: Request):
+    check_stream(request)
+    state = request.app.state
+    now = time.time()
+    days = epg.settings(state.db)['days']
+    channels = []
+    # No awaits: capture one coherent view before streaming in the thread pool.
+    for row in state.db.rows('SELECT * FROM channels ORDER BY rowid'):
+        # Deletion unregisters the engine before awaiting producer shutdown.
+        channel = state.channels.get(row['id'])
+        if channel is None:
+            continue
+        channel.scheduled(now=now)
+        channels.append((row, channel.timeline.snapshot()))
+    return StreamingResponse(epg.xmltv(channels, now, now + days * 86400),
+                             media_type='application/xml; charset=utf-8',
+                             headers={'Cache-Control': 'no-store'})
+
+
 @app.get("/playlist.m3u8")
 async def playlist(request: Request):
     check_stream(request)
-    body = '#EXTM3U\n'
+    body = f'#EXTM3U x-tvg-url="{epg_url(request)}"\n'
     for row in request.app.state.db.rows('SELECT * FROM channels ORDER BY rowid'):
         body += f'#EXTINF:-1 tvg-id="{row["id"]}" group-title="Tube IPTV",{row["name"]}\n{base_url(request)}/channels/{row["id"]}/index.m3u8{token_suffix()}\n'
     return Response(body, media_type="application/vnd.apple.mpegurl", headers={"Cache-Control": "no-store"})

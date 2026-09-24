@@ -207,8 +207,8 @@ class Channel:
             else:
                 self.scheduled()
 
-    def scheduled(self):
-        return self.timeline.sync(self.db.media(self.id),
+    def scheduled(self, now=None):
+        return self.timeline.sync(self.db.media(self.id), now=now,
                                   preserve_removed=self.retained_current()) if self.timeline else None
 
     def advance_after_source(self, slot, reason):

@@ -36,10 +36,21 @@ Use the channel selector to switch channels and **New channel** to create one. N
 | --- | --- |
 | <http://localhost:8000> | Web console and browser preview |
 | <http://localhost:8000/playlist.m3u8> | IPTV playlist containing all channels |
+| <http://localhost:8000/epg.xml> | XMLTV programme guide for all channels |
 | <http://localhost:8000/channels/main/index.m3u8> | Main HLS stream |
 | <http://localhost:8000/api/docs> | OpenAPI documentation |
 
 For a TV or another device, replace `localhost` with the server's IP address or hostname. Copy the IPTV URL into VLC, Kodi, or another IPTV player. The browser preview starts only after clicking **Watch channel**; opening the console or downloading the playlist does not start media production.
+
+### XMLTV programme guide
+
+The IPTV playlist advertises `/epg.xml` through its `x-tvg-url` header. Players that support this attribute can discover the guide automatically. Otherwise, copy **XMLTV EPG URL** from the console's IPTV card into your player's EPG settings. Channel IDs match the playlist's `tvg-id` values and remain stable after renaming.
+
+**EPG horizon** applies to all channels: choose 1–7 days ahead, with 2 days as the default. The setting persists across restarts. The guide includes the current programme with its full start time and the last programme with its full end time. Empty channels have no programme entries. Times are UTC; players can display them in their local timezone.
+
+EPG is a forecast of the shared channel clock, without adjustment for HLS buffering. Adding or removing sources, learning a duration, or ending a video early can change upcoming times. Unknown durations use the same estimated one-hour slots as playback. Refresh EPG in your player to see changes; no historical listings, descriptions, thumbnails, or catch-up playback are provided.
+
+Each request streams a consistent snapshot of the schedule without starting extraction, FFmpeg, or a viewer session. The export is generated in memory and is not cached by the server. It uses the same `STREAM_TOKEN` protection as the playlist; copied and advertised links include that token and respect `PUBLIC_URL`. `ADMIN_PASSWORD` protects the settings API (`GET`/`PATCH /api/epg/settings`, body `{"days": 2}`), while the XMLTV endpoint uses only the stream token.
 
 ### Configuration
 
@@ -146,7 +157,7 @@ Keep the Uvicorn port and `PORT` identical: FFmpeg uploads segments to that port
 | `app/main.py` | API, lifecycle, authorization, and IPTV endpoints |
 | `app/static/` | Console, player/API modules, and responsive styles |
 
-The API and UI expose independent channels with separate sources and schedules. Custom ordering and XMLTV require additional implementation. Any extension should keep yt-dlp as the only source interpreter; local media scanners and Plex/Jellyfin libraries are not supported.
+The API and UI expose independent channels with separate sources and schedules, plus a shared XMLTV export. Custom ordering requires additional implementation. Any extension should keep yt-dlp as the only source interpreter; local media scanners and Plex/Jellyfin libraries are not supported.
 
 ## Testing
 
