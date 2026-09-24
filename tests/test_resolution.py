@@ -25,3 +25,18 @@ def test_encoded_canvas(resolution, width, height):
     video = json.loads(probe.stdout)['streams'][0]
     assert (video['width'], video['height']) == (width, height)
     assert video['sample_aspect_ratio'] == '1:1'
+
+
+@pytest.mark.parametrize('encoder', ['software', 'vaapi', 'qsv', 'nvenc'])
+@pytest.mark.parametrize('bitrate', [100, 6000, 25000])
+def test_custom_bitrate_and_segment_budget(encoder, bitrate):
+    from app.engine import MAX_SEGMENT, MAX_BUFFER
+    command = ffmpeg_command([], {}, 'http://localhost/unused', encoder=encoder,
+                             resolution='4k', target_bitrate=bitrate)
+    assert command[command.index('-b:v') + 1] == f'{bitrate}k'
+    maxrate = int(command[command.index('-maxrate') + 1][:-1])
+    buffer_rate = int(command[command.index('-bufsize') + 1][:-1])
+    assert bitrate <= maxrate <= 30000
+    # Four seconds, full VBV burst, AAC and generous transport overhead.
+    assert ((maxrate + 128) * 4 + buffer_rate) * 1000 / 8 * 1.15 < MAX_SEGMENT
+    assert MAX_BUFFER >= 6 * MAX_SEGMENT

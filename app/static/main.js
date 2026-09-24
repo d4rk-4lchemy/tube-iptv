@@ -1,4 +1,5 @@
 import { api, $, escape, toast, action } from './api.js';
+import { syncProgrammes } from './programmes.js';
 import { startPreview, stopPreview, syncPreview } from './player.js';
 let state, sourceSignature = '', deleteId = null;
 let selectedChannel = null, channels = [], refreshRequest = 0, editingChannel = null;
@@ -9,11 +10,16 @@ function formatTime(seconds) {
   return [Math.floor(value / 3600), Math.floor(value / 60) % 60, value % 60].map(n => String(n).padStart(2, '0')).join(':');
 }
 function render(data) {
+  const channelChanged = state?.channel.id !== data.channel.id;
   state = data;
   syncPreview(data);
+  syncProgrammes(data);
   if (!$('finish-current').disabled) $('finish-current').checked = data.finish_current_on_remove;
   if (!$('channel-resolution').disabled) $('channel-resolution').value = data.resolution;
   if (!$('channel-fps').disabled) $('channel-fps').value = String(data.fps);
+  if (!$('channel-bitrate').disabled && (channelChanged || document.activeElement !== $('channel-bitrate'))) {
+    $('channel-bitrate').value = data.target_bitrate ?? '';
+  }
   $('connection').textContent = 'Server connected';
   $('channel-name').textContent = data.channel.name;
   const number = String(channels.findIndex(c => c.id === data.channel.id) + 1).padStart(2, '0');
@@ -24,11 +30,13 @@ function render(data) {
   $('remove-channel').disabled = channels.length < 2;
   $('state-label').textContent = labels[data.state] || data.state;
   $('state-dot').classList.toggle('live', data.state === 'live');
-  $('now-playing').textContent = data.now?.title || 'No programme scheduled';
+  $('now-playing').textContent = data.schedule_mode === 'programmes' ? `${data.now?.programme_title || data.programme?.title || 'No planned programme'}${data.now?.kind === 'video' ? ' · ' + data.now.title : ''}` : data.now?.title || 'No programme scheduled';
+  $('shuffle-label').textContent = data.schedule_mode === 'programmes' ? '▦ WEEKLY' : '⤨ SHUFFLE';
   const position = data.now ? `${formatTime(data.now.offset)} / ${data.now.estimated ? '~' : ''}${formatTime(data.now.duration)}` : '';
   $('programme-position').textContent = position;
   $('programme-position').title = data.now?.estimated ? 'Estimated slot length: the source has not reported its duration yet.' : 'Current channel time; HLS playback has a short buffer delay.';
   $('media-count').textContent = data.media_count;
+  $('media-count-label').textContent = data.schedule_mode === 'programmes' ? 'Videos available' : 'Videos in rotation';
   $('viewers').textContent = data.viewers;
   $('buffer').textContent = (data.buffer_bytes / 1024 / 1024).toFixed(1);
   $('source-count').textContent = data.sources.length;
@@ -36,12 +44,13 @@ function render(data) {
   $('download-playlist').href = data.playlist_url;
   $('epg-url').value = data.epg_url;
   if (!$('epg-days').disabled) $('epg-days').value = String(data.epg_days);
+  renderCookies(data.cookies_uploaded);
   $('current-channel').textContent = data.yt_dlp.channel;
   $('current-version').textContent = data.yt_dlp.version;
   $('encoder-label').textContent = `H.264 / AAC · ${data.encoder.toUpperCase()}`;
   $('start-preview').disabled = !data.stream_available;
-  $('preview-title').textContent = data.media_count ? 'The clock keeps running.' : 'Start with a source.';
-  $('preview-description').textContent = data.media_count ? 'Join the current programme. The clock runs without viewers, too.' : 'Add your first link to create a channel.';
+  $('preview-title').textContent = data.stream_available ? 'The clock keeps running.' : 'Start with a source.';
+  $('preview-description').textContent = data.stream_available ? 'Join the current programme. The clock runs without viewers, too.' : 'Add your first link to create a channel.';
   $('install-version').disabled = data.update.state === 'installing';
   $('install-version').firstChild.textContent = data.update.state === 'installing' ? 'Installing… ' : 'Install version ';
   if (data.update.state === 'installing') $('update-status').textContent = 'Downloading, checking SHA-256 and validating the version…';
@@ -220,6 +229,20 @@ $('channel-resolution').addEventListener('change', () => {
   });
 });
 
+$('channel-bitrate').addEventListener('change', () => {
+  const input = $('channel-bitrate');
+  if (!input.reportValidity()) return;
+  const path = channelPath('settings');
+  const target_bitrate = input.value === '' ? null : Number(input.value);
+  input.disabled = true;
+  action(async () => {
+    try {
+      await api(path, { method: 'PATCH', body: JSON.stringify({ target_bitrate }) });
+      toast('Bitrate saved. Applies from the next video or stream start.');
+    } finally { input.disabled = false; await refresh(); }
+  });
+});
+
 let gpuDevices = [], gpuDevice = '';
 function renderGPUDevices() {
   const encoder = $('gpu-driver').value;
@@ -263,3 +286,43 @@ $('gpu-settings').onsubmit = event => {
   });
 };
 action(loadGPU);
+
+function renderCookies(uploaded) {
+  $('cookies-status').textContent = uploaded ? 'Cookies saved. Used for new extraction jobs.' : 'No cookies uploaded.';
+  $('delete-cookies').hidden = !uploaded;
+}
+
+$('upload-cookies').onclick = () => $('cookies-file').click();
+$('cookies-file').addEventListener('change', () => {
+  const input = $('cookies-file');
+  const file = input.files[0];
+  if (!file) return;
+  action(async () => {
+    const button = $('upload-cookies');
+    button.disabled = true;
+    $('delete-cookies').disabled = true;
+    try {
+      if (file.size > 2 * 1024 * 1024) throw new Error('Cookies file must be at most 2 MiB.');
+      await api('cookies', { method: 'PUT', headers: { 'Content-Type': 'text/plain' }, body: file });
+      renderCookies(true);
+      toast('Cookies uploaded. New extraction jobs will use them.');
+    } finally {
+      button.disabled = false;
+      input.value = '';
+      $('delete-cookies').disabled = false;
+    }
+  });
+});
+
+$('delete-cookies').onclick = () => action(async () => {
+  $('delete-cookies').disabled = true;
+  $('upload-cookies').disabled = true;
+  try {
+    await api('cookies', { method: 'DELETE' });
+    renderCookies(false);
+    toast('Cookies deleted. New extraction jobs will run without them.');
+  } finally {
+    $('delete-cookies').disabled = false;
+    $('upload-cookies').disabled = false;
+  }
+});

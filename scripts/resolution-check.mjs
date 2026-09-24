@@ -60,7 +60,7 @@ try {
   expect(playback.error).toBeNull();
   expect(errors).toEqual([]);
   const state = await api('status');
-  expect(state.buffer_bytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+  expect(state.buffer_bytes).toBeLessThanOrEqual(192 * 1024 * 1024);
   await page.screenshot({ path: 'artifacts/playback-4k.png', fullPage: true });
   const result = { source, streams, playback, diagnostics: state.diagnostics, buffer_bytes: state.buffer_bytes };
   await writeFile('artifacts/playback-4k.json', JSON.stringify(result, null, 2));

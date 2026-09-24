@@ -13,9 +13,10 @@ from . import config, gpu
 from .process import stop_process
 from .video import RESOLUTIONS
 from .timeline import Timeline, known_duration
+from .programme_playback import ProgrammeTimeline, BLACK_URL
 
-MAX_SEGMENT = 8 * 1024 * 1024
-MAX_BUFFER = 64 * 1024 * 1024
+MAX_SEGMENT = 24 * 1024 * 1024
+MAX_BUFFER = 192 * 1024 * 1024
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -30,8 +31,11 @@ class Segment:
     source_url: str | None = None
 
 
-def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duration=None, fps=60, resolution="1080p", device=None):
+def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duration=None, fps=60, resolution="1080p", device=None, target_bitrate=None):
     width, height, bitrate, maxrate = RESOLUTIONS[resolution]
+    if target_bitrate is not None:
+        bitrate = target_bitrate
+        maxrate = min(30000, (bitrate * 4 + 2) // 3)
     encoder = encoder or config.ENCODER
     device = device if device is not None else config.VAAPI_DEVICE
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "warning", "-threads", "2", "-filter_threads", "2"]
@@ -59,7 +63,7 @@ def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duratio
         if fmt.get("acodec") != "none" and audio_index is None:
             audio_index = index
     if video_index is None:
-        cmd += ["-f", "lavfi", "-i", f"color=c=0x161a18:s={width}x{height}:r={synthetic_fps}"]
+        cmd += ["-f", "lavfi", "-i", f"color=c={'black' if info.get('synthetic_black') else '0x161a18'}:s={width}x{height}:r={synthetic_fps}"]
         video_index = len(formats)
     if audio_index is None:
         audio_index = len(formats) + (video_index == len(formats))
@@ -87,8 +91,8 @@ def ffmpeg_command(formats, info, destination, encoder=None, offset=0.0, duratio
         cmd += ["-fps_mode:v", "cfr"]
     if duration is not None:
         cmd += ["-t", f"{max(0.04, duration):.6f}"]
-    # Limit 4K VBV bursts so four-second segments fit the 8 MiB ingest cap.
-    buffer_rate = maxrate if resolution == "4k" else maxrate * 2
+    # Bound VBV bursts so four-second segments fit the 24 MiB ingest cap.
+    buffer_rate = min(30000, maxrate * 2) if target_bitrate is not None else (maxrate if resolution == "4k" else maxrate * 2)
     # With native timing, force keyframes by elapsed time, not frame count.
     cmd += ["-b:v", f"{bitrate}k", "-maxrate", f"{maxrate}k", "-bufsize", f"{buffer_rate}k",
             "-g", str(10000 if fps == "original" else fps * 4), "-keyint_min", "1",
@@ -121,7 +125,9 @@ class Channel:
         self.task = None
         self.monitor = None
         self.process = None
-        self.timeline = Timeline(db, channel_id) if db else None
+        self.rotation = Timeline(db, channel_id) if db else None
+        self.programme_timeline = ProgrammeTimeline(db, channel_id) if db else None
+        self.timeline = self.rotation
         self.clock_task = None
         self.clip_time = None
         self.clip_duration = 0.0
@@ -140,6 +146,7 @@ class Channel:
         self.state = "idle"
         self.closed = False
         self.now = None
+        self.producing_slot = None
         self.error = None
         self.events = deque(maxlen=30)
         self.changed = asyncio.Condition()
@@ -154,6 +161,10 @@ class Channel:
     @property
     def resolution(self):
         return self.db.setting(f'resolution:{self.id}', '1080p') if self.db else '1080p'
+
+    @property
+    def target_bitrate(self):
+        return self.db.setting(f'target_bitrate:{self.id}') if self.db else None
 
     @property
     def fps(self):
@@ -171,7 +182,7 @@ class Channel:
                 and any(s.clip == self.clip for s in self.segments))))
 
     def available(self):
-        return (bool(self.db.media(self.id)) or self.retained_current()
+        return (bool(self.db.programmes(self.id)) or bool(self.db.media(self.id)) or self.retained_current()
                 or (self.finish_current_on_remove and any(s.clip == self.retained_clip for s in self.segments)))
 
     async def reconcile_sources(self):
@@ -181,14 +192,30 @@ class Channel:
         async with self.lifecycle:
             if self.closed:
                 return
-            allowed = {item['url'] for item in self.db.media(self.id)}
-            if self.prefetch_key and self.prefetch_key[0] not in allowed:
-                await self.cancel_prefetch()
-            removed_current = self.now and self.now['url'] not in allowed
-            retain = removed_current and self.retained_current()
+            scheduled = self.scheduled()
+            if self.timeline is self.programme_timeline and self.producing_slot:
+                # A producer may already be encoding the next occurrence into RAM.
+                # Compare at its media start, not at the earlier public wall clock.
+                scheduled = self.timeline.position(max(time.time(), self.producing_slot.starts_at))
+            programme_id = self.now.get('programme_id') if self.now else None
+            allowed = {item['url'] for item in self.db.media(self.id, programme_id)}
+            if self.db.programmes(self.id):
+                allowed.add(BLACK_URL)
+            if self.prefetch_key:
+                next_slot = self.timeline.position(self.prefetch_key[0][1] + .001)
+                if not next_slot or next_slot.key != self.prefetch_key[0]:
+                    await self.cancel_prefetch()
+            gap_changed = (self.now and self.timeline is self.programme_timeline
+                           and self.now.get('programme_id') is None and scheduled
+                           and (scheduled.item.get('programme_id') is not None
+                                or self.now.get('programme_ends_at') != scheduled.item.get('programme_ends_at')))
+            removed_current = self.now and (self.now['url'] not in allowed or gap_changed
+                or (self.now['url'] == BLACK_URL and scheduled and scheduled.item['url'] != BLACK_URL))
+            retain = removed_current and not gap_changed and self.now['url'] != BLACK_URL and self.retained_current()
             if retain:
                 self.retained_clip = self.clip
-            stale_buffer = any(s.source_url and s.source_url not in allowed
+            buffer_allowed = {m['url'] for m in self.db.media(self.id, all_sources=True)} | ({BLACK_URL} if self.db.programmes(self.id) else set())
+            stale_buffer = any(s.source_url and s.source_url not in buffer_allowed
                                and not (self.finish_current_on_remove and s.clip == self.retained_clip) for s in self.segments)
             if (removed_current and not retain) or (self.state == "ended" and allowed):
                 await self.stop()
@@ -196,7 +223,7 @@ class Channel:
                 self.error = None
                 self.event('Removed source stopped immediately · queue rebuilt')
                 self.scheduled()
-                if allowed and (self.viewers or self.waiters):
+                if self.available() and (self.viewers or self.waiters):
                     self.task = asyncio.create_task(self.run())
             elif stale_buffer:
                 self.segments.clear()
@@ -208,8 +235,22 @@ class Channel:
                 self.scheduled()
 
     def scheduled(self, now=None):
-        return self.timeline.sync(self.db.media(self.id), now=now,
-                                  preserve_removed=self.retained_current()) if self.timeline else None
+        if not self.db:
+            return None
+        self.timeline = self.programme_timeline if self.db.programmes(self.id) else self.rotation
+        return self.timeline.sync(self.db.media(self.id), now=now, preserve_removed=self.retained_current())
+
+    async def programmes_changed(self, deleted=None):
+        async with self.lifecycle:
+            was_programmed = self.timeline is self.programme_timeline
+            self.scheduled()
+            changed_mode = was_programmed != (self.timeline is self.programme_timeline)
+            if changed_mode or (deleted and self.now and self.now.get('programme_id') == deleted):
+                await self.stop()
+                self.stream_revision += 1
+                if self.available() and (self.viewers or self.waiters):
+                    self.task = asyncio.create_task(self.run())
+            await self.cancel_prefetch()
 
     def advance_after_source(self, slot, reason):
         """Rebase the schedule when a source ends before its allotted slot."""
@@ -235,7 +276,7 @@ class Channel:
             if self.closed:
                 return
             self.viewers[viewer] = time.monotonic()
-            if (self.task is None or self.task.done()) and not (self.state == "ended" and not self.db.media(self.id)):
+            if (self.task is None or self.task.done()) and not (self.state == "ended" and not self.db.programmes(self.id) and not self.db.media(self.id)):
                 self.task = asyncio.create_task(self.run())
             if self.monitor is None or self.monitor.done():
                 self.monitor = asyncio.create_task(self.watch())
@@ -263,6 +304,7 @@ class Channel:
         self.aborted.clear()
         self.bytes = 0
         self.now = None
+        self.producing_slot = None
         self.retained_clip = None
         self.state = "idle"
         self.event("Stream stopped · RAM released · channel clock continues")
@@ -295,7 +337,7 @@ class Channel:
         if not current or current.key != slot.key:
             return None
         next_slot = self.timeline.position(slot.ends_at + .001)
-        if not next_slot or next_slot.item['url'] not in {m['url'] for m in self.db.media(self.id)}:
+        if not next_slot or next_slot.item['url'] not in {m['url'] for m in self.db.media(self.id, next_slot.item.get('programme_id'))}:
             return None
         resolution = self.resolution
         self.prefetch_key = (next_slot.key, resolution)
@@ -328,7 +370,11 @@ class Channel:
         try:
             while True:
                 slot = self.scheduled()
-                if completed is not None and self.clip == self.retained_clip and not self.db.media(self.id):
+                programmed = self.timeline is self.programme_timeline
+                if programmed:
+                    position = max(time.time(), self.media_buffer.tail_deadline or 0)
+                    slot = self.timeline.position(position)
+                if not programmed and completed is not None and self.clip == self.retained_clip and not self.db.media(self.id):
                     self.state = "ended"
                     self.now = None
                     self.event("Retained video finished · final HLS segments available")
@@ -344,9 +390,10 @@ class Channel:
                 item = slot.item
                 resume_offset = resume[1] if resume and resume[0] == slot.key else None
                 resume = None
-                offset = resume_offset if resume_offset is not None else slot.offset(time.time())
+                offset = resume_offset if resume_offset is not None else slot.offset(max(time.time(), self.media_buffer.tail_deadline or 0) if programmed else time.time())
                 self.state = "buffering"
                 self.now = item
+                self.producing_slot = slot
                 self.clip = secrets.token_hex(12)
                 self.ingest_finished.clear()
                 self.pending.clear()
@@ -360,7 +407,13 @@ class Channel:
                     if self.prefetch_task and self.prefetch_key == (slot.key, resolution):
                         resolved = await self.prefetch_task
                     await self.cancel_prefetch()
-                    info, formats = resolved or await self.sources.resolve(item["url"], resolution=resolution)
+                    if item['url'] == BLACK_URL:
+                        info, formats = {'synthetic_black': True}, []
+                    elif resolved:
+                        info, formats = resolved
+                    else:
+                        job = self.sources.resolve(item['url'], resolution=resolution)
+                        info, formats = await asyncio.wait_for(job, max(.05, min(90, slot.ends_at - time.time()))) if programmed else await job
                     elapsed = round(time.monotonic() - resolving, 3)
                     self.metrics['last_resolve_seconds'] = elapsed
                     if self.metrics['resolve_seconds'] is None:
@@ -369,22 +422,30 @@ class Channel:
                     self.event("Input formats: " + ", ".join(
                         f"{f.get('format_id', '?')} ({f.get('protocol', '?')}, {f.get('vcodec', '?')})"
                         for f in formats))
+                    if programmed and item['url'] != BLACK_URL:
+                        self.programme_timeline.mark_live(item['url'], now=max(time.time(), self.media_buffer.tail_deadline or 0), is_live=bool(info.get('is_live')))
                     if known_duration(info.get("duration")) and not info.get("is_live"):
                         self.db.update_duration(self.id, item['url'], info['duration'])
                     current = self.scheduled()
+                    if programmed:
+                        current = self.timeline.position(max(time.time(), self.media_buffer.tail_deadline or 0))
                     # Extraction may cross a programme boundary. Never play a stale slot.
                     if not current or current.key != slot.key:
                         continue
                     slot = current
-                    offset = resume_offset if resume_offset is not None else slot.offset(time.time())
-                    remaining = slot.item['duration'] - offset
+                    self.now = item = slot.item
+                    self.producing_slot = slot
+                    offset = resume_offset if resume_offset is not None else slot.offset(max(time.time(), self.media_buffer.tail_deadline or 0) if programmed else time.time())
+                    remaining = slot.ends_at - max(time.time(), self.media_buffer.tail_deadline or 0) if programmed else slot.item['duration'] - offset
+                    if programmed and info.get('is_live'):
+                        remaining = min(remaining, slot.item['programme_ends_at'] - max(time.time(), self.media_buffer.tail_deadline or 0))
                     if remaining < 0.25:
                         completed = slot.key
                         continue
                     self.clip_time = max(time.time(), self.media_buffer.tail_deadline or 0)
                     self.prefetch_task = asyncio.create_task(self.prefetch_next(slot))
                     destination = f"{self.upload_base}/{self.clip}"
-                    command = ffmpeg_command(formats, info, destination, offset=offset, duration=remaining, fps=self.fps, resolution=resolution, **gpu.settings(self.db))
+                    command = ffmpeg_command(formats, info, destination, offset=offset, duration=remaining, fps=self.fps, resolution=resolution, target_bitrate=self.target_bitrate, **gpu.settings(self.db))
                     self.event(f"On air: {item['title']} · joining at {int(offset)}s")
                     self.ffmpeg_started = time.monotonic()
                     self.startup_started = started
@@ -426,16 +487,25 @@ class Channel:
                     # Do not wait for the scheduled boundary or drain the RAM
                     # reserve.  Its final segments remain in FIFO order while
                     # the next encoder is already preparing a replacement.
-                    self.advance_after_source(slot, "Source ended before its scheduled boundary")
+                    if programmed:
+                        boundary = max(time.time(), self.media_buffer.tail_deadline or 0)
+                        if slot.item['estimated'] and not info.get('is_live'):
+                            # EOF taught us the real duration. Refill with the now-known
+                            # video instead of treating successful playback as a failure.
+                            self.timeline.sync(now=boundary, preserve_removed=self.retained_current())
+                        elif shortfall > 1:
+                            self.timeline.advance(slot, now=boundary)
+                    else:
+                        self.advance_after_source(slot, "Source ended before its scheduled boundary")
                     following = self.scheduled()
-                    if following and following.key != slot.key:
+                    if not programmed and following and following.key != slot.key:
                         resume = (following.key, 0.0)
                     completed = slot.key
                     self.scheduled()
                     failures = 0
                     skipped_urls.clear()
                     recovery_attempts.pop(slot.key, None)
-                    if self.clip == self.retained_clip and not self.db.media(self.id):
+                    if not programmed and self.clip == self.retained_clip and not self.db.media(self.id):
                         await self.media_buffer.drain()
                         self.state = "ended"
                         self.now = None
@@ -461,13 +531,13 @@ class Channel:
                     skipped_urls.add(item['url'])
                     self.advance_after_source(slot, "Source failed")
                     following = self.scheduled()
-                    if following and following.key != slot.key:
+                    if not programmed and following and following.key != slot.key:
                         resume = (following.key, 0.0)
                     completed = slot.key
                     # Continue through the remaining sources without delay. If
                     # every enabled source failed, retain the former backoff
                     # before beginning a fresh round.
-                    available_urls = {media['url'] for media in self.db.media(self.id)}
+                    available_urls = {media['url'] for media in self.db.media(self.id, item.get('programme_id'))}
                     if available_urls and available_urls <= skipped_urls:
                         self.event("All enabled sources failed; retrying the rotation shortly")
                         skipped_urls.clear()
@@ -657,10 +727,17 @@ class Channel:
         slot = self.scheduled()
         now = ({**slot.item, "starts_at": slot.starts_at, "ends_at": slot.ends_at,
                 "offset": slot.offset(time.time())} if slot else None)
+        programmed = self.timeline is self.programme_timeline
+        actual = self.programme_timeline.held() if programmed else None
+        nominal = next(self.programme_timeline.snapshot().slots(time.time(), time.time() + 1), None) if programmed else None
         return {"state": self.state, "viewers": len(self.viewers), "now": now,
+                "schedule_mode": "programmes" if programmed else "rotation", "timezone": config.TZ,
+                "gap_mode": self.db.setting(f'gap_mode:{self.id}', 'black') if self.db else 'black',
+                "programme": ({"title": nominal.item['title'], "starts_at": nominal.starts_at, "ends_at": nominal.ends_at} if nominal else None),
+                "actual_programme": actual,
                 "buffer_bytes": self.bytes, "segments": len(self.segments), "error": self.error,
                 "events": list(self.events), "encoder": gpu.settings(self.db)["encoder"],
-                "finish_current_on_remove": self.finish_current_on_remove, "fps": self.fps, "resolution": self.resolution,
+                "finish_current_on_remove": self.finish_current_on_remove, "fps": self.fps, "resolution": self.resolution, "target_bitrate": self.target_bitrate,
                 "stream_revision": self.stream_revision, "stream_available": self.available() if self.db else False,
                 "diagnostics": {**self.metrics,
                     "reserve_segments": self.media_buffer.count if self.media_buffer else 0,

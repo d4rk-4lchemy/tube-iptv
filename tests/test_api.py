@@ -414,3 +414,42 @@ async def test_gpu_requires_auth_and_same_origin(client, monkeypatch):
     monkeypatch.setattr(config, 'ADMIN_PASSWORD', 'secret')
     assert (await client.get('/api/gpu')).status_code == 401
     assert (await client.patch('/api/gpu', json={'encoder': 'software'})).status_code == 401
+
+
+async def test_target_bitrate_persists_isolated_and_resets(client):
+    from app.engine import Channel
+    second = (await client.post('/api/channels', json={'name': 'Bitrate'})).json()['id']
+    path = f'/api/channels/{second}/settings'
+    assert (await client.get('/api/status')).json()['target_bitrate'] is None
+    response = await client.patch(path, json={'target_bitrate': 25000})
+    assert response.status_code == 200
+    assert response.json()['target_bitrate'] == 25000
+    await client.patch(path, json={'fps': 25})
+    assert (await client.get(f'/api/channels/{second}/status')).json()['target_bitrate'] == 25000
+    assert app.state.channel.target_bitrate is None
+    reopened = db.Database()
+    try:
+        assert Channel(second, reopened, app.state.sources).target_bitrate == 25000
+    finally:
+        reopened.conn.close()
+    assert (await client.patch(path, json={'target_bitrate': None})).json()['target_bitrate'] is None
+    await client.patch(path, json={'target_bitrate': 100})
+    await client.delete(f'/api/channels/{second}')
+    assert app.state.db.setting(f'target_bitrate:{second}') is None
+
+
+@pytest.mark.parametrize('value', [True, 0, -1, 99, 25001, 1.5, '25000', 'auto'])
+async def test_invalid_target_bitrate_is_atomic(client, value):
+    response = await client.patch('/api/settings', json={'target_bitrate': value, 'fps': 25})
+    assert response.status_code == 422
+    assert app.state.channel.target_bitrate is None
+    assert app.state.channel.fps == 60
+
+
+async def test_target_bitrate_preserves_playback(client, monkeypatch):
+    channel, stopped = await playing_fixture(monkeypatch)
+    task, slot = channel.task, channel.scheduled()
+    response = await client.patch('/api/settings', json={'target_bitrate': 25000})
+    assert response.status_code == 200 and channel.target_bitrate == 25000
+    assert channel.task is task and not stopped.is_set()
+    assert len(channel.segments) == 2 and channel.scheduled().key == slot.key

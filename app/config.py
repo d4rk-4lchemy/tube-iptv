@@ -1,5 +1,12 @@
 import os
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+TZ = os.getenv('TZ', 'Europe/Warsaw')
+try:
+    TIMEZONE = ZoneInfo(TZ)
+except ZoneInfoNotFoundError as exc:
+    raise ValueError(f'Invalid TZ: {TZ}. Use an IANA timezone such as Europe/Warsaw.') from exc
 
 DATA = Path(os.getenv("DATA_DIR", "/data"))
 PORT = int(os.getenv("PORT", "8000"))

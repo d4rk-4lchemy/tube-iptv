@@ -3,6 +3,7 @@ import json
 import re
 from urllib.parse import urlparse
 from .config import MAX_ITEMS
+from .cookies import extraction_cookies
 from .process import capture
 from .video import RESOLUTIONS
 
@@ -34,6 +35,10 @@ class Sources:
             command += ["--js-runtimes", "deno", "--js-runtimes", "node"]
         return command
 
+    async def extract(self, arguments, timeout):
+        with extraction_cookies() as cookies:
+            return await capture(self.base() + cookies + arguments, timeout)
+
     def refresh(self, source):
         if source["id"] in self.tasks:
             return
@@ -45,7 +50,7 @@ class Sources:
     async def _refresh(self, source):
         try:
             async with self.limit:
-                raw = await capture(self.base() + ["--flat-playlist", "--playlist-end", str(MAX_ITEMS),
+                raw = await self.extract(["--flat-playlist", "--playlist-end", str(MAX_ITEMS),
                     "--skip-download", "--dump-single-json", "--", source["url"]], 180)
             info = json.loads(raw)
             entries = info.get("entries") if "entries" in info else [info]
@@ -70,7 +75,7 @@ class Sources:
 
     async def resolve(self, url, resolution="1080p"):
         height = RESOLUTIONS[resolution][1]
-        raw = await capture(self.base() + ["--no-playlist", "--skip-download", "-f",
+        raw = await self.extract(["--no-playlist", "--skip-download", "-f",
             FORMAT_SELECTOR.replace("1080", str(height)), "--dump-single-json", "--", url], 90)
         info = json.loads(raw)
         formats = info.get("requested_formats") or [info]

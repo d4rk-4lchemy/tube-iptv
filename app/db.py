@@ -25,7 +25,11 @@ class Database:
             id TEXT PRIMARY KEY, source_id TEXT REFERENCES sources(id) ON DELETE CASCADE,
             url TEXT NOT NULL, title TEXT NOT NULL, duration REAL);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS programmes(
+            id TEXT PRIMARY KEY, channel_id TEXT NOT NULL REFERENCES channels(id),
+            name TEXT NOT NULL, duration_minutes INTEGER NOT NULL, rules TEXT NOT NULL);
         """)
+        self._migrate_sources()
         self.conn.execute("UPDATE sources SET state='error', error='Interrupted by a restart. Refresh the source.' WHERE state='pending'")
         self.conn.commit()
 
@@ -36,13 +40,47 @@ class Database:
         with self.conn:
             return self.conn.execute(sql, args)
 
-    def sources(self, channel="main"):
-        return self.rows("""SELECT s.*, COUNT(m.id) AS count FROM sources s LEFT JOIN media m
-            ON m.source_id=s.id WHERE s.channel_id=? GROUP BY s.id ORDER BY s.created_at,s.id""", (channel,))
+    def _migrate_sources(self):
+        if 'programme_id' in {r['name'] for r in self.rows('PRAGMA table_info(sources)')}:
+            return
+        # Rebuild the old channel-wide UNIQUE constraint without losing media FKs.
+        self.conn.commit()
+        self.conn.execute('PRAGMA foreign_keys=OFF')
+        try:
+            self.conn.executescript("""
+            BEGIN;
+            CREATE TABLE sources_new(
+                id TEXT PRIMARY KEY, channel_id TEXT REFERENCES channels(id), url TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+                state TEXT NOT NULL DEFAULT 'pending', error TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                programme_id TEXT REFERENCES programmes(id) ON DELETE CASCADE);
+            INSERT INTO sources_new SELECT *, NULL FROM sources;
+            DROP TABLE sources;
+            ALTER TABLE sources_new RENAME TO sources;
+            CREATE UNIQUE INDEX sources_channel_url ON sources(channel_id,url) WHERE programme_id IS NULL;
+            CREATE UNIQUE INDEX sources_programme_url ON sources(programme_id,url) WHERE programme_id IS NOT NULL;
+            COMMIT;
+            """)
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            self.conn.execute('PRAGMA foreign_keys=ON')
 
-    def media(self, channel="main"):
+    def programmes(self, channel="main"):
+        rows = self.rows('SELECT * FROM programmes WHERE channel_id=? ORDER BY rowid', (channel,))
+        return [{**row, 'rules': json.loads(row['rules'])} for row in rows]
+
+    def sources(self, channel="main", programme_id=None, all_sources=False):
+        return self.rows("""SELECT s.*, COUNT(m.id) AS count FROM sources s LEFT JOIN media m
+            ON m.source_id=s.id WHERE s.channel_id=? AND (? OR s.programme_id IS ?)
+            GROUP BY s.id ORDER BY s.created_at,s.id""", (channel, all_sources, programme_id))
+
+    def media(self, channel="main", programme_id=None, all_sources=False):
         return self.rows("""SELECT m.* FROM media m JOIN sources s ON m.source_id=s.id
-            WHERE s.channel_id=? AND s.enabled=1""", (channel,))
+            WHERE s.channel_id=? AND s.enabled=1 AND (? OR s.programme_id IS ?)""",
+            (channel, all_sources, programme_id))
 
     def replace_media(self, source, title, items):
         with self.conn:

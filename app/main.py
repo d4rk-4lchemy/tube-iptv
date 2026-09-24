@@ -14,10 +14,12 @@ from fastapi.staticfiles import StaticFiles
 from starlette.requests import ClientDisconnect
 from pydantic import BaseModel, Field
 from . import config, epg, gpu
+from .cookies import MAX_COOKIE_BYTES, cookie_path, save_cookies
 from .db import Database
 from .engine import Channel, MAX_SEGMENT
 from .sources import Sources, validate_url
 from .versions import Versions
+from .programmes_api import router as programmes_router, programme_for
 
 
 @asynccontextmanager
@@ -62,6 +64,7 @@ def find_channel(request, channel_id):
 
 
 app = FastAPI(title="Tube IPTV", lifespan=lifespan, docs_url="/api/docs", openapi_url="/api/openapi.json", redoc_url=None)
+app.include_router(programmes_router)
 STATIC = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
@@ -105,9 +108,10 @@ async def status(request: Request, channel_id: str = 'main'):
     engine = find_channel(request, channel_id)
     channel = state.db.rows("SELECT * FROM channels WHERE id=?", (channel_id,))[0]
     return {"channel": channel, **engine.status(), "sources": state.db.sources(channel_id),
-            "media_count": len({m["url"] for m in state.db.media(channel_id)}),
+            "media_count": len({m["url"] for m in state.db.media(channel_id, all_sources=bool(state.db.programmes(channel_id)))}),
             "yt_dlp": {k: v for k, v in state.versions.current().items() if k != "path"},
             "update": state.versions.job,
+            "cookies_uploaded": cookie_path().is_file(),
             "playlist_url": base_url(request) + "/playlist.m3u8" + token_suffix(),
             "epg_url": epg_url(request),
             "epg_days": epg.settings(state.db)['days'],
@@ -118,17 +122,20 @@ class SourceInput(BaseModel):
     url: str = Field(min_length=8, max_length=4096)
 
 
+@app.post("/api/channels/{channel_id}/programmes/{programme_id}/sources", status_code=202)
 @app.post("/api/sources", status_code=202)
 @app.post("/api/channels/{channel_id}/sources", status_code=202)
-async def add_source(payload: SourceInput, request: Request, channel_id: str = 'main'):
+async def add_source(payload: SourceInput, request: Request, channel_id: str = 'main', programme_id: str | None = None):
     find_channel(request, channel_id)
+    if programme_id is not None:
+        programme_for(request, channel_id, programme_id)
     try:
         url = validate_url(payload.url.strip())
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     source = {"id": secrets.token_hex(12), "url": url}
     try:
-        request.app.state.db.execute("INSERT INTO sources(id,channel_id,url) VALUES(?,?,?)", (source["id"], channel_id, url))
+        request.app.state.db.execute("INSERT INTO sources(id,channel_id,url,programme_id) VALUES(?,?,?,?)", (source["id"], channel_id, url, programme_id))
     except sqlite3.IntegrityError:
         raise HTTPException(409, "This URL has already been added")
     request.app.state.sources.refresh(source)
@@ -221,7 +228,7 @@ async def delete_channel(channel_id: str, request: Request):
         if len(state.channels) == 1:
             raise HTTPException(409, 'Keep at least one channel')
         del state.channels[channel_id]
-        tasks = [state.sources.tasks[s['id']] for s in state.db.sources(channel_id)
+        tasks = [state.sources.tasks[s['id']] for s in state.db.sources(channel_id, all_sources=True)
                  if s['id'] in state.sources.tasks]
         for task in tasks:
             task.cancel()
@@ -230,16 +237,20 @@ async def delete_channel(channel_id: str, request: Request):
         await state.uploads.pop(channel_id).close()
         with state.db.conn:
             state.db.conn.execute('DELETE FROM sources WHERE channel_id=?', (channel_id,))
+            state.db.conn.execute('DELETE FROM programmes WHERE channel_id=?', (channel_id,))
             state.db.conn.execute('DELETE FROM channels WHERE id=?', (channel_id,))
-            state.db.conn.execute('DELETE FROM settings WHERE key IN (?,?,?,?)',
-                                  (f'timeline:{channel_id}', f'finish_current_on_remove:{channel_id}', f'fps:{channel_id}', f'resolution:{channel_id}'))
+            state.db.conn.execute('DELETE FROM settings WHERE key IN (?,?)', (f'programme_timeline:{channel_id}', f'gap_mode:{channel_id}'))
+            state.db.conn.execute('DELETE FROM settings WHERE key IN (?,?,?,?,?)',
+                                  (f'timeline:{channel_id}', f'finish_current_on_remove:{channel_id}', f'fps:{channel_id}', f'resolution:{channel_id}', f'target_bitrate:{channel_id}'))
     return Response(status_code=204)
 
 
 class PlaybackSettings(BaseModel):
+    gap_mode: Literal["black", "sources"] = "black"
     finish_current_on_remove: bool = False
     fps: Literal[24, 25, 30, 50, 60, "original"] = 60
     resolution: Literal["480p", "720p", "1080p", "4k"] = "1080p"
+    target_bitrate: int | None = Field(default=None, strict=True, ge=100, le=25000)
 
 
 @app.patch('/api/settings')
@@ -248,10 +259,10 @@ async def update_settings(payload: PlaybackSettings, request: Request, channel_i
     channel = find_channel(request, channel_id)
     for key in payload.model_fields_set:
         request.app.state.db.set_setting(f'{key}:{channel_id}', getattr(payload, key))
-    if 'finish_current_on_remove' in payload.model_fields_set:
+    if {'finish_current_on_remove', 'gap_mode'} & payload.model_fields_set:
         await channel.reconcile_sources()
     return {'finish_current_on_remove': channel.finish_current_on_remove, 'fps': channel.fps,
-            'resolution': channel.resolution}
+            'resolution': channel.resolution, 'target_bitrate': channel.target_bitrate, 'gap_mode': request.app.state.db.setting(f'gap_mode:{channel_id}', 'black')}
 
 
 class GPUSettings(BaseModel):
@@ -273,6 +284,26 @@ async def update_gpu(payload: GPUSettings, request: Request):
     value = {'encoder': payload.encoder, 'device': payload.device if payload.encoder != 'software' else ''}
     request.app.state.db.set_setting('gpu_engine', value)
     return value
+
+
+@app.delete("/api/cookies")
+async def delete_cookies():
+    cookie_path().unlink(missing_ok=True)
+    return {"cookies_uploaded": False}
+
+
+@app.put("/api/cookies")
+async def upload_cookies(request: Request):
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > MAX_COOKIE_BYTES:
+            raise HTTPException(413, "Cookies file must be at most 2 MiB.")
+        raw.extend(chunk)
+    try:
+        save_cookies(raw)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    return {"cookies_uploaded": True}
 
 
 @app.get("/api/versions/{channel}")

@@ -9,6 +9,7 @@ services:
     volumes:
       - tube-data:/data
     environment:
+      TZ: ${TZ:-Europe/Warsaw}
       ENCODER: ${ENCODER:-software}
       IDLE_SECONDS: ${IDLE_SECONDS:-25}
       PUBLIC_URL: ${PUBLIC_URL:-}
