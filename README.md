@@ -5,7 +5,8 @@
 </p>
 
 <p align="center"><strong>Your IPTV channels, built from yt-dlp sources.</strong><br>
-Add videos or playlists, and viewers of each channel join the same live programme position.</p>
+Add videos or playlists, and viewers of each channel join the same live programme position.<br>
+<i>Made with Codex</i></p>
 
 Tube IPTV turns links supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp) into independent HLS channels with continuous schedules. It includes an English web console, browser preview, IPTV playlist export, and selectable stable/nightly yt-dlp releases without rebuilding the image.
 
@@ -21,6 +22,10 @@ Tube IPTV turns links supported by [yt-dlp](https://github.com/yt-dlp/yt-dlp) in
 - CPU encoding by default, with optional VAAPI and Intel Quick Sync encoding.
 - A single Uvicorn worker with persistent scheduling metadata in SQLite.
 
+## Screenshot
+
+![Main UI](screenshots/main.png)
+
 ## Quick start
 
 Requirements: Docker with Compose and a host that can run FFmpeg in the image.
@@ -30,6 +35,44 @@ docker compose up -d --build
 ```
 
 Open the web console at <http://localhost:8000> and add a video, playlist, or channel URL.
+
+If you want to create the Compose file yourself, save the following as `docker-compose.yml` in the project directory:
+
+```yaml
+services:
+  tube:
+    build: .
+    image: tube-iptv:local
+    container_name: tube-iptv
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - tube-data:/data
+    environment:
+      TZ: ${TZ:-Europe/Warsaw}
+      ENCODER: ${ENCODER:-software}
+      IDLE_SECONDS: ${IDLE_SECONDS:-25}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8000}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      STREAM_TOKEN: ${STREAM_TOKEN:-}
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  tube-data:
+```
+
+Start it with:
+
+```bash
+docker compose -f docker-compose.yml up -d --build
+```
 
 Use the channel selector to switch channels and **New channel** to create one. Names, sources, previews, diagnostics, resolutions, frame rates, and source-removal settings apply to the selected channel. The yt-dlp installation and updates are shared by all channels. The IPTV playlist contains every channel; each starts media production only when watched. Removing a channel stops its stream and deletes its sources and schedule; at least one channel must remain. Existing installations keep their `main` channel and schedule.
 
